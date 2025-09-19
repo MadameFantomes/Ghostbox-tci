@@ -1,10 +1,11 @@
 "use client";
 
 /**
- * Ghostbox TCI — Simple FR (balayage toutes stations)
- * - Lit /public/stations.json si présent (formats acceptés: tableau [{name,url}] ou objet {Groupe:[{name,url}|{name,urls:[]}]}).
- * - Déplie urls[], déduplique par URL, ne garde que HTTPS.
- * - Balayage AUTO corrigé (index courant via ref).
+ * Ghostbox TCI — Simple FR (fix: charge /stations.json, “Suivante” robuste, auto-skip)
+ * - Lit /public/stations.json si présent (tableau [{name,url}] OU groupes {"France":[...]} avec url OU urls[]).
+ * - Déplie urls[], filtre HTTPS, déduplique, mélange pour varier.
+ * - Bouton "SUIVANTE" et balayage AUTO utilisent playIndex() qui saute automatiquement
+ *   les flux qui ne jouent pas et avance l’index de façon fiable.
  * - Contrôles: MARCHE, BALAYAGE AUTO, VITESSE, VOLUME, ÉCHO, DÉBIT (bruit inter-station).
  * - Fond: /radio-vintage.svg.
  */
@@ -25,7 +26,7 @@ const FALLBACK_STATIONS = [
 export default function Page() {
   const audioElRef = useRef(null);
 
-  // Audio graph
+  // Audio
   const ctxRef = useRef(null);
   const masterRef = useRef(null);
   const destRef = useRef(null);
@@ -38,18 +39,22 @@ export default function Page() {
   const echoFbRef = useRef(null);
   const echoWetRef = useRef(null);
 
-  // Stations et index
+  // Stations
   const [stations, setStations] = useState(FALLBACK_STATIONS);
   const stationsRef = useRef(FALLBACK_STATIONS);
+
+  // Index courant (state + ref pour les timers)
   const [idx, setIdx] = useState(0);
   const idxRef = useRef(0);
 
-  // UI
+  // UI / état
   const [etat, setEtat] = useState("prêt");
   const [marche, setMarche] = useState(false);
   const [auto, setAuto] = useState(false);
   const [compat, setCompat] = useState(false);
+  const [sourceInfo, setSourceInfo] = useState(""); // badge “N stations …”
   const sweepTimerRef = useRef(null);
+  const playingLockRef = useRef(false); // évite les lectures concurrentes
 
   // 4 contrôles
   const [vitesse, setVitesse] = useState(0.45); // 0..1 → 250..2500ms
@@ -64,22 +69,27 @@ export default function Page() {
   const burstGain = () => 0.15 + debit * 0.85;                    // 0.15..1
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-  /* ——— Charge /stations.json si présent ——— */
+  /* ——— Charger /stations.json si présent ——— */
   useEffect(() => {
-    fetch("/stations.json")
-      .then((r) => (r.ok ? r.json() : Promise.reject()))
-      .then((json) => {
+    (async () => {
+      try {
+        const r = await fetch("/stations.json", { cache: "no-store" });
+        if (!r.ok) throw new Error("stations.json introuvable");
+        const json = await r.json();
         const flat = normalizeStationsJson(json);
         if (flat.length) {
           setStations(flat);
           stationsRef.current = flat;
-          // si on était hors bornes, on remet à 0
-          setIdx(0); idxRef.current = 0;
+          idxRef.current = 0; setIdx(0);
+          setSourceInfo(`${flat.length} stations (depuis stations.json)`);
+          return;
         }
-      })
-      .catch(() => {
+        setSourceInfo(`${FALLBACK_STATIONS.length} stations (fallback)`);
+      } catch {
         stationsRef.current = FALLBACK_STATIONS;
-      });
+        setSourceInfo(`${FALLBACK_STATIONS.length} stations (fallback)`);
+      }
+    })();
   }, []);
 
   function normalizeStationsJson(json) {
@@ -87,11 +97,16 @@ export default function Page() {
     const push = (name, url, suffix="") => {
       if (!url || typeof url !== "string") return;
       if (!/^https:/i.test(url)) return; // HTTPS only
-      list.push({ name: name || new URL(url).host + suffix, url });
+      try {
+        // nettoie les espaces/quotes parasites
+        url = url.trim();
+        const nm = (name && name.trim()) || new URL(url).host + suffix;
+        list.push({ name: nm, url });
+      } catch { /* URL invalide */ }
     };
 
     if (Array.isArray(json)) {
-      json.forEach((s, i) => {
+      json.forEach((s) => {
         if (!s) return;
         if (s.url) push(s.name, s.url);
         if (Array.isArray(s.urls)) s.urls.forEach((u, k) => push(s.name, u, ` #${k+1}`));
@@ -99,23 +114,19 @@ export default function Page() {
     } else if (json && typeof json === "object") {
       Object.entries(json).forEach(([group, arr]) => {
         if (!Array.isArray(arr)) return;
-        arr.forEach((s, i) => {
+        arr.forEach((s) => {
           if (!s) return;
-          if (s.url) push(s.name || `${group}`, s.url);
-          if (Array.isArray(s.urls)) s.urls.forEach((u, k) => push(s.name || `${group}`, u, ` #${k+1}`));
+          if (s.url) push(s.name || group, s.url);
+          if (Array.isArray(s.urls)) s.urls.forEach((u, k) => push(s.name || group, u, ` #${k+1}`));
         });
       });
     }
 
     // dédup par URL
     const seen = new Set();
-    list = list.filter((s) => {
-      if (seen.has(s.url)) return false;
-      seen.add(s.url);
-      return true;
-    });
+    list = list.filter((s) => (seen.has(s.url) ? false : seen.add(s.url)));
 
-    // option: mélange pour varier
+    // mélange pour varier le balayage
     for (let i = list.length - 1; i > 0; i--) {
       const j = Math.floor(Math.random() * (i + 1));
       [list[i], list[j]] = [list[j], list[i]];
@@ -123,7 +134,7 @@ export default function Page() {
     return list;
   }
 
-  /* ——— Init audio ——— */
+  /* ——— Init WebAudio ——— */
   async function initAudio() {
     if (ctxRef.current) return;
     const ctx = new (window.AudioContext || window.webkitAudioContext)();
@@ -179,7 +190,7 @@ export default function Page() {
     await initAudio();
     const ctx = ctxRef.current;
     if (ctx.state === "suspended") await ctx.resume();
-    await tuneTo(idxRef.current);
+    await playIndex(idxRef.current); // joue la station courante avec auto-skip si HS
     setMarche(true);
   }
   function powerOff() {
@@ -193,12 +204,19 @@ export default function Page() {
     setEtat("arrêté");
   }
 
-  /* ——— Tuning + bruit inter-stations ——— */
-  async function tuneTo(nextIndex) {
-    const el = audioElRef.current; if (!el) return;
+  /* ——— Lecture robuste d’un index (avec auto-skip des flux HS) ——— */
+  async function playIndex(startIndex, tries = 0) {
     const list = stationsRef.current;
-    const entry = list[nextIndex];
-    if (!entry) return;
+    if (!list.length) return;
+    if (tries >= list.length) {
+      setEtat("aucun flux lisible");
+      return;
+    }
+    if (playingLockRef.current) return; // on ignore si déjà en cours
+    playingLockRef.current = true;
+
+    const el = audioElRef.current;
+    const entry = list[startIndex];
     const url = typeof entry === "string" ? entry : entry.url;
 
     // Burst de bruit (balayage)
@@ -206,66 +224,70 @@ export default function Page() {
     const now = ctx.currentTime;
     const burstDur = burstMs() / 1000;
 
-    if (!compat) {
-      try {
+    try {
+      if (!compat) {
         radioGainRef.current.gain.cancelScheduledValues(now);
         radioGainRef.current.gain.linearRampToValueAtTime(0.0001, now + 0.06);
-      } catch {}
-      try {
-        noiseGainRef.current.gain.cancelScheduledValues(now);
-        noiseGainRef.current.gain.setTargetAtTime(burstGain(), now, 0.04);
-      } catch {}
-    } else {
-      el.volume = 0; // mute <audio> en compat pendant le bruit
-      try {
-        noiseGainRef.current.gain.cancelScheduledValues(now);
-        noiseGainRef.current.gain.setTargetAtTime(burstGain(), now, 0.04);
-      } catch {}
-    }
+      } else {
+        el.volume = 0; // mute <audio> en compat pendant le bruit
+      }
+      noiseGainRef.current.gain.cancelScheduledValues(now);
+      noiseGainRef.current.gain.setTargetAtTime(burstGain(), now, 0.04);
+    } catch {}
 
     setEtat("balayage…");
     await sleep(Math.max(60, burstMs() * 0.45));
 
-    // Charger/lecture
+    // Tentative de lecture
     try {
       el.crossOrigin = "anonymous";
       el.pause(); el.src = url; el.load();
-      await el.play();
-      setEtat("connexion…");
+
+      // Timeout de lecture (3 s) pour éviter de rester bloqué
+      const playPromise = el.play();
+      const timeout = new Promise((_, rej) => setTimeout(() => rej(new Error("timeout")), 3000));
+      await Promise.race([playPromise, timeout]);
+
+      // Brancher WebAudio si possible
+      await attachMedia();
+
+      // Fondu retour: on remonte la radio, on coupe le bruit
+      const after = ctx.currentTime + Math.max(0.08, burstDur * 0.6);
+      if (!compat) {
+        try { radioGainRef.current.gain.setTargetAtTime(1, after, 0.08); } catch {}
+      } else {
+        el.volume = clamp01(volume);
+      }
+      try { noiseGainRef.current.gain.setTargetAtTime(0.0001, after, 0.1); } catch {}
+
+      // Mise à jour index/état (succès)
+      idxRef.current = startIndex; setIdx(startIndex);
+      const name = entry?.name || (entry?.url ? new URL(entry.url).host : "");
+      setEtat(compat ? `lecture (compatibilité)` : `lecture`);
     } catch (e) {
-      setEtat("échec (CORS/format)");
+      // Échec → on passe à la suivante
+      try { noiseGainRef.current.gain.setTargetAtTime(0.0001, ctx.currentTime + 0.05, 0.08); } catch {}
+      const next = (startIndex + 1) % list.length;
+      playingLockRef.current = false;
+      await playIndex(next, tries + 1);
       return;
     }
 
-    await attachMedia();
-
-    // Fondu retour
-    const after = ctx.currentTime + Math.max(0.08, burstDur * 0.6);
-    if (!compat) {
-      try { radioGainRef.current.gain.setTargetAtTime(1, after, 0.08); } catch {}
-    } else {
-      el.volume = clamp01(volume);
-    }
-    try { noiseGainRef.current.gain.setTargetAtTime(0.0001, after, 0.1); } catch {}
-
-    // Met à jour l’index courant (state + ref)
-    idxRef.current = nextIndex;
-    setIdx(nextIndex);
-    setEtat(compat ? "lecture (compatibilité)" : "lecture");
+    playingLockRef.current = false;
   }
 
-  /* ——— Balayage AUTO (corrigé: utilise idxRef) ——— */
+  /* ——— Balayage AUTO ——— */
   function startSweep() {
     stopSweep();
-    const step = async () => {
+    const tick = async () => {
       if (!marche) return;
       const list = stationsRef.current;
       if (!list.length) return;
       const next = (idxRef.current + 1) % list.length;
-      await tuneTo(next);
-      sweepTimerRef.current = setTimeout(step, msFromSpeed(vitesse));
+      await playIndex(next);
+      sweepTimerRef.current = setTimeout(tick, msFromSpeed(vitesse));
     };
-    sweepTimerRef.current = setTimeout(step, msFromSpeed(vitesse));
+    sweepTimerRef.current = setTimeout(tick, msFromSpeed(vitesse));
   }
   function stopSweep() {
     if (sweepTimerRef.current) clearTimeout(sweepTimerRef.current);
@@ -292,7 +314,8 @@ export default function Page() {
 
   /* ——— UI ——— */
   const list = stationsRef.current;
-  const currentName = list[idxRef.current]?.name || (list[idxRef.current]?.url ? new URL(list[idxRef.current].url).host : "");
+  const current = list[idxRef.current];
+  const currentName = current?.name || (current?.url ? new URL(current.url).host : "");
 
   return (
     <main style={styles.page}>
@@ -305,7 +328,7 @@ export default function Page() {
               <div style={styles.brandSub}>Ghostbox • Formation TCI</div>
             </div>
             <div style={styles.rightHeader}>
-              <div style={styles.badge}>{list.length} stations chargées</div>
+              <div style={styles.badge}>{sourceInfo || `${list.length} stations`}</div>
               <div style={styles.lampsRow}>
                 <Lamp label="MARCHE" on={marche} />
                 <Lamp label="AUTO" on={auto} colorOn="#86fb6a" />
@@ -330,9 +353,8 @@ export default function Page() {
               <Switch label="MARCHE" on={marche} onChange={async v => { setMarche(v); v ? await powerOn() : powerOff(); }} />
               <Switch label="BALAYAGE AUTO" on={auto} onChange={(v) => setAuto(v)} />
               <Bouton label="SUIVANTE" onClick={async () => {
-                const list = stationsRef.current;
-                const next = (idxRef.current + 1) % list.length;
-                await tuneTo(next);
+                const n = (idxRef.current + 1) % list.length;
+                await playIndex(n);
               }} />
             </div>
 
@@ -351,7 +373,7 @@ export default function Page() {
       </div>
 
       <p style={{ color: "rgba(255,255,255,0.7)", marginTop: 10, fontSize: 12 }}>
-        Astuce : vérifie <code>/stations.json</code> dans ton navigateur — le badge doit afficher le bon total. Mets <strong>AUTO</strong> pour balayer toutes les stations.
+        Vérifie que <code>/stations.json</code> s’ouvre bien dans le navigateur. Le badge doit afficher le bon total (pas 7).
       </p>
     </main>
   );
