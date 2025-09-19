@@ -3,18 +3,17 @@
 /**
  * Ghostbox TCI — FR
  * - Fusionne /public/stations.json + /public/stations-extra.json (dédoublonné)
- * - Balayage "direct" (HLS/playlist écartés) + live-edge forcé à chaque saut
- * - Bruit de fond très discret + ducking auto
- * - ENREGISTRER : MP3 si supporté, sinon WAV (fallback)
- * - MICRO ENR : mixe le micro AU SEUL BUS D’ENREGISTREMENT (pas dans les HP)
- * - Filtre radio “TCI” auto (si WebAudio autorisé)
+ * - Balayage "direct" (HLS/playlist écartés) + live-edge forcé
+ * - Bruit discret + ducking
+ * - MICRO mixé au même fichier d’enregistrement (bus REC)
+ * - ENREGISTRER : MP3 si supporté, sinon WAV
+ * - Fallback CORS : captureStream() si MediaElementSource indisponible
  */
 
 import React, { useEffect, useRef, useState } from "react";
 
 const AUTO_FILTER = true;
 
-// ------- Fallback (quelques flux directs HTTPS) -------
 const FALLBACK_STATIONS = [
   "https://icecast.radiofrance.fr/fip-midfi.mp3",
   "https://icecast.radiofrance.fr/fiprock-midfi.mp3",
@@ -28,12 +27,14 @@ const FALLBACK_STATIONS = [
 export default function Page() {
   const audioElRef = useRef(null);
 
-  // AudioContext + graph
+  // Audio
   const ctxRef = useRef(null);
-  const masterRef = useRef(null);        // sort dans les HP
-  const destRef = useRef(null);          // MediaStream (REC)
-  const recordMixRef = useRef(null);     // bus REC (master + micro)
-  const mediaSrcRef = useRef(null);
+  const masterRef = useRef(null);        // vers HP
+  const recordMixRef = useRef(null);     // bus REC (master + mic)
+  const destRef = useRef(null);          // MediaStreamDestination (REC)
+
+  // Sources
+  const mediaSrcRef = useRef(null);      // node pour la radio (MediaElementSource OU captureStream source)
   const radioGainRef = useRef(null);
 
   // Micro
@@ -41,14 +42,14 @@ export default function Page() {
   const micGainRef = useRef(null);
   const micStreamRef = useRef(null);
 
-  // Bruit de balayage
+  // Bruit
   const noiseNodeRef = useRef(null);
   const noiseHPRef = useRef(null);
   const noiseFilterRef = useRef(null);
   const noiseLPRef = useRef(null);
   const noiseGainRef = useRef(null);
 
-  // Radio FX (auto-filtre “TCI”)
+  // Radio FX
   const radioHPRef = useRef(null);
   const radioLPRef = useRef(null);
   const radioShelfRef = useRef(null);
@@ -60,27 +61,27 @@ export default function Page() {
   const echoFbRef = useRef(null);
   const echoWetRef = useRef(null);
 
-  // Clic de commutation
+  // Clic
   const clickBusRef = useRef(null);
 
-  // Stations / index
+  // Stations
   const [stations, setStations] = useState(FALLBACK_STATIONS);
   const stationsRef = useRef(FALLBACK_STATIONS);
   const [idx, setIdx] = useState(0);
   const idxRef = useRef(0);
 
-  // États UI
+  // UI
   const [etat, setEtat] = useState("prêt");
   const [marche, setMarche] = useState(false);
   const [auto, setAuto] = useState(false);
-  const [compat, setCompat] = useState(false);
+  const [compat, setCompat] = useState(false);  // compat = on lit sans traitement (si aucun ancrage au graphe)
   const [micOn, setMicOn] = useState(false);
   const [micErr, setMicErr] = useState("");
   const sweepTimerRef = useRef(null);
   const playingLockRef = useRef(false);
 
   // Contrôles
-  const [vitesse, setVitesse] = useState(0.45); // 250..2500 ms
+  const [vitesse, setVitesse] = useState(0.45);
   const [volume, setVolume]  = useState(0.9);
   const [echo, setEcho]      = useState(0.3);
   const [debit, setDebit]    = useState(0.4);
@@ -98,16 +99,9 @@ export default function Page() {
   const burstMs  = () => Math.round(120 + debit * 520);
   const burstGain = () => Math.min(0.40, 0.08 + debit * 0.32);
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const supportsType = (m) => window.MediaRecorder?.isTypeSupported?.(m) || false;
 
-  const supportsType = (m) =>
-    typeof window !== "undefined" &&
-    window.MediaRecorder &&
-    typeof MediaRecorder.isTypeSupported === "function" &&
-    MediaRecorder.isTypeSupported(m);
-
-  /* =========================
-     Chargement des stations
-  ==========================*/
+  /* ===== Charger stations (deux fichiers) ===== */
   useEffect(() => {
     (async () => {
       const all = [];
@@ -119,9 +113,7 @@ export default function Page() {
         const r2 = await fetch("/stations-extra.json", { cache: "no-store" });
         if (r2.ok) all.push(...normalizeStationsJson(await r2.json()));
       } catch {}
-
       let flat = all.length ? all : FALLBACK_STATIONS;
-      // dédoublonnage final
       const seen = new Set();
       flat = flat.filter((s) => (s && s.url && !seen.has(s.url) ? (seen.add(s.url), true) : false));
       setStations(flat); stationsRef.current = flat;
@@ -134,7 +126,7 @@ export default function Page() {
     const push = (name, url, suffix = "") => {
       if (!url || typeof url !== "string") return;
       if (!/^https:/i.test(url)) return;
-      if (!isDirectish(url)) return; // vire HLS/playlist/agrégateurs
+      if (!isDirectish(url)) return;
       try {
         url = url.trim();
         const nm = (name && name.trim()) || new URL(url).host + suffix;
@@ -156,7 +148,6 @@ export default function Page() {
         });
       });
     }
-    // mélange léger
     for (let i = list.length - 1; i > 0; i--) {
       const j = Math.floor(Math.random() * (i + 1));
       [list[i], list[j]] = [list[j], list[i]];
@@ -164,7 +155,6 @@ export default function Page() {
     return list;
   }
 
-  // bloque HLS / playlists / agrégateurs (liens non audio directs)
   function isDirectish(u) {
     try {
       const L = u.toLowerCase();
@@ -179,30 +169,28 @@ export default function Page() {
     return `${url}${sep}ghostbox_live=${Date.now()}`;
   }
 
-  /* =========================
-     Init Audio + Graph
-  ==========================*/
+  /* ===== Init Audio ===== */
   async function initAudio() {
     if (ctxRef.current) return;
     const ctx = new (window.AudioContext || window.webkitAudioContext)();
     ctxRef.current = ctx;
 
-    // Master (vers HP)
+    // Master (HP)
     const master = ctx.createGain(); master.gain.value = clamp01(volume); master.connect(ctx.destination);
     masterRef.current = master;
 
-    // Bus REC : master + micro -> recordMix -> MediaStreamDestination
+    // REC bus (master + mic)
     const recordMix = ctx.createGain(); recordMix.gain.value = 1; recordMixRef.current = recordMix;
     const dest = ctx.createMediaStreamDestination(); destRef.current = dest;
     recordMix.connect(dest);
 
-    // Radio branchera sur master; master va aussi vers recordMix
+    // Master va aussi vers REC
     master.connect(recordMix);
 
-    // Radio
+    // Radio gain (sera câblé par attachMedia)
     const gRadio = ctx.createGain(); gRadio.gain.value = 1; radioGainRef.current = gRadio;
 
-    // Bruit (HP→BP→LP→Gain)
+    // Bruit
     const noise = createNoiseNode(ctx); noiseNodeRef.current = noise;
     const hpN = ctx.createBiquadFilter(); hpN.type = "highpass"; hpN.frequency.value = 160; hpN.Q.value = 0.7;
     const bp  = ctx.createBiquadFilter(); bp.type = "bandpass"; bp.Q.value = 0.55; bp.frequency.value = 1800;
@@ -210,14 +198,14 @@ export default function Page() {
     noiseHPRef.current = hpN; noiseFilterRef.current = bp; noiseLPRef.current = lpN;
     const gNoise = ctx.createGain(); gNoise.gain.value = 0; noiseGainRef.current = gNoise;
 
-    // Radio auto-filtre “TCI”
+    // Auto filtre radio
     const hp = ctx.createBiquadFilter();  hp.type = "highpass"; hp.frequency.value = 320; hp.Q.value = 0.7;
     const lp = ctx.createBiquadFilter();  lp.type = "lowpass";  lp.frequency.value = 3400; lp.Q.value = 0.7;
     const shelf = ctx.createBiquadFilter(); shelf.type = "highshelf"; shelf.frequency.value = 2500; shelf.gain.value = -4;
     const drive = createDriveNode(ctx, 0.22);
     radioHPRef.current = hp; radioLPRef.current = lp; radioShelfRef.current = shelf; driveRef.current = drive;
 
-    // Dry & ÉCHO
+    // Dry & Écho
     const dry = ctx.createGain(); dry.gain.value = 1; dryRef.current = dry;
     const dly = ctx.createDelay(1.2); dly.delayTime.value = 0.34;
     const fb  = ctx.createGain(); fb.gain.value = 0.25;
@@ -225,7 +213,7 @@ export default function Page() {
     const wet = ctx.createGain(); wet.gain.value = 0;
     echoDelayRef.current = dly; echoFbRef.current = fb; echoWetRef.current = wet;
 
-    // “clic”
+    // Clic
     const clickBus = ctx.createGain(); clickBus.gain.value = 0; clickBus.connect(master);
     clickBusRef.current = clickBus;
 
@@ -233,11 +221,11 @@ export default function Page() {
     const sum = ctx.createGain(); sum.gain.value = 1;
     // bruit : noise → HP → BP → LP → gNoise → sum
     noise.connect(hpN); hpN.connect(bp); bp.connect(lpN); lpN.connect(gNoise); gNoise.connect(sum);
-    // radio (branche via attachMedia → gRadio), puis :
+    // radio (branchée via attachMedia → gRadio)
     gRadio.connect(sum);
 
-    sum.connect(dry);  dry.connect(master);           // HP
-    sum.connect(dly);  dly.connect(wet); wet.connect(master); // HP
+    sum.connect(dry);  dry.connect(master);
+    sum.connect(dly);  dly.connect(wet); wet.connect(master);
 
     try { noise.start(0); } catch {}
   }
@@ -251,7 +239,6 @@ export default function Page() {
     return src;
   }
 
-  // légère saturation
   function createDriveNode(ctx, amount = 0.25) {
     const ws = ctx.createWaveShaper(); ws.curve = makeDistortionCurve(amount); ws.oversample = "4x"; return ws;
   }
@@ -263,9 +250,9 @@ export default function Page() {
   function applyAutoFilterProfile() {
     const ctx = ctxRef.current; if (!AUTO_FILTER || !ctx || !radioHPRef.current) return;
     const now = ctx.currentTime;
-    const hpF = 260 + Math.random() * 160;      // 260..420 Hz
-    const lpF = 2800 + Math.random() * 1400;    // 2.8..4.2 kHz
-    const shelfGain = -(2 + Math.random() * 5); // -2..-7 dB
+    const hpF = 260 + Math.random() * 160;
+    const lpF = 2800 + Math.random() * 1400;
+    const shelfGain = -(2 + Math.random() * 5);
     const driveAmt = 0.16 + Math.random() * 0.12;
     try {
       radioHPRef.current.frequency.setTargetAtTime(hpF, now, 0.08);
@@ -275,15 +262,20 @@ export default function Page() {
     } catch {}
   }
 
+  /* ===== Attacher la radio au graphe (avec fallback captureStream) ===== */
   async function attachMedia() {
     if (!ctxRef.current || !audioElRef.current) return;
     if (mediaSrcRef.current) return;
+
+    const ctx = ctxRef.current;
+    const el = audioElRef.current;
+
+    // 1) Tentative standard : MediaElementSource
     try {
-      const src = ctxRef.current.createMediaElementSource(audioElRef.current);
+      const src = ctx.createMediaElementSource(el);
       mediaSrcRef.current = src;
 
       if (AUTO_FILTER && radioHPRef.current) {
-        // src → HP → LP → Shelf → Drive → gRadio
         src.connect(radioHPRef.current);
         radioHPRef.current.connect(radioLPRef.current);
         radioLPRef.current.connect(radioShelfRef.current);
@@ -293,68 +285,71 @@ export default function Page() {
         src.connect(radioGainRef.current);
       }
 
-      // --- Ducking auto du bruit quand la radio joue ---
-      const el = audioElRef.current;
-      const duckToFloor = () => {
-        const now = ctxRef.current.currentTime;
-        try {
-          noiseGainRef.current.gain.cancelScheduledValues(now);
-          noiseGainRef.current.gain.setTargetAtTime(BASE_NOISE, now, 0.12);
-        } catch {}
-      };
-      el.addEventListener("playing", duckToFloor);
-      el.addEventListener("timeupdate", duckToFloor);
-
       setCompat(false);
-    } catch {
-      setCompat(true); // CORS : pas de traitement possible
+      return;
+    } catch (e) {
+      // continue vers fallback
     }
+
+    // 2) Fallback : captureStream() → MediaStreamSource
+    try {
+      const stream = el.captureStream?.();
+      if (stream && stream.getAudioTracks().length > 0) {
+        const src2 = ctx.createMediaStreamSource(stream);
+        mediaSrcRef.current = src2;
+
+        if (AUTO_FILTER && radioHPRef.current) {
+          src2.connect(radioHPRef.current);
+          radioHPRef.current.connect(radioLPRef.current);
+          radioLPRef.current.connect(radioShelfRef.current);
+          radioShelfRef.current.connect(driveRef.current);
+          driveRef.current.connect(radioGainRef.current);
+        } else {
+          src2.connect(radioGainRef.current);
+        }
+
+        setCompat(false); // on a une vraie source dans le graphe
+        return;
+      }
+    } catch (e) {}
+
+    // 3) Impossible d’ancrer la radio : compat à true (lecture sans mixage au graphe)
+    setCompat(true);
   }
 
-  /* =========================
-     Micro (dans REC seulement)
-  ==========================*/
+  /* ===== Micro (dans REC uniquement) ===== */
   async function toggleMic(on) {
     setMicErr("");
     if (!on) {
-      try {
-        micSrcRef.current?.disconnect();
-        micGainRef.current?.disconnect();
-      } catch {}
+      try { micSrcRef.current?.disconnect(); micGainRef.current?.disconnect(); } catch {}
       try { micStreamRef.current?.getTracks().forEach(t => t.stop()); } catch {}
       micSrcRef.current = null; micGainRef.current = null; micStreamRef.current = null;
       setMicOn(false);
-      return;
+      return true;
     }
-
     try {
       await initAudio();
       const ctx = ctxRef.current;
       const stream = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          channelCount: 2,
-          echoCancellation: true,    // aide si HP ouverts
-          noiseSuppression: true,
-          autoGainControl: false
-        }
+        audio: { channelCount: 2, echoCancellation: true, noiseSuppression: true, autoGainControl: false }
       });
       micStreamRef.current = stream;
       const mic = ctx.createMediaStreamSource(stream);
-      const micGain = ctx.createGain(); micGain.gain.value = 1.0; // volume REC micro
+      const micGain = ctx.createGain(); micGain.gain.value = 1.0;
       mic.connect(micGain);
-      // IMPORTANT : micro -> recordMix (REC) UNIQUEMENT
+      // IMPORTANT : micro vers bus REC seulement
       micGain.connect(recordMixRef.current);
       micSrcRef.current = mic; micGainRef.current = micGain;
       setMicOn(true);
+      return true;
     } catch (e) {
       setMicErr(e?.message || "Accès micro refusé");
       setMicOn(false);
+      return false;
     }
   }
 
-  /* =========================
-     Power / Lecture
-  ==========================*/
+  /* ===== Power / Lecture ===== */
   async function powerOn() {
     await initAudio();
     const ctx = ctxRef.current;
@@ -371,9 +366,7 @@ export default function Page() {
     if (el) { el.pause(); el.src = ""; el.load(); }
     if (enr) { try { stopRecording(); } catch {} setEnr(false); }
     try { await ctxRef.current?.suspend(); } catch {}
-    setMarche(false);
-    setAuto(false);
-    setEtat("arrêté");
+    setMarche(false); setAuto(false); setEtat("arrêté");
     playingLockRef.current = false;
   }
 
@@ -385,17 +378,14 @@ export default function Page() {
     for (let i = 0; i < d.length; i++) d[i] = (Math.random()*2-1) * Math.pow(1 - i/d.length, 12);
     const src = ctx.createBufferSource(); src.buffer = buf;
     const g = clickBusRef.current; const now = ctx.currentTime;
-    try {
-      g.gain.cancelScheduledValues(now); g.gain.setValueAtTime(level, now);
-      g.gain.exponentialRampToValueAtTime(0.0001, now + dur);
-    } catch {}
+    try { g.gain.cancelScheduledValues(now); g.gain.setValueAtTime(level, now);
+          g.gain.exponentialRampToValueAtTime(0.0001, now + dur); } catch {}
     src.connect(g); src.start();
   }
 
   function playScanBurst(targetGain, durSec) {
     const ctx = ctxRef.current; if (!ctx) return;
     const now = ctx.currentTime;
-
     const bp = noiseFilterRef.current, hp = noiseHPRef.current, lp = noiseLPRef.current;
     const g = noiseGainRef.current?.gain;
 
@@ -478,7 +468,7 @@ export default function Page() {
       const timeout = new Promise((_, rej) => setTimeout(() => rej(new Error("timeout")), 3500));
       await Promise.race([playP, timeout]);
 
-      await attachMedia();
+      await attachMedia(); // <— ANCRAGE au graphe (MediaElementSource OU captureStream)
       applyAutoFilterProfile();
 
       const after = ctx.currentTime + Math.max(0.08, dur * 0.6);
@@ -517,21 +507,20 @@ export default function Page() {
     sweepTimerRef.current = null;
   }
 
-  /* =========================
-     ENREGISTREMENT (MP3 si possible, sinon WAV)
-  ==========================*/
-  function startRecording() {
-    if (!destRef.current) return;
+  /* ===== ENREGISTREMENT (MP3/WAV) ===== */
+  async function startRecording() {
+    await initAudio();
 
-    // 1) MP3 natif via MediaRecorder (si dispo)
+    // Auto-armer le micro si pas déjà ON (pour garantir mix Ghostbox+Mic)
+    if (!micOn) { await toggleMic(true); }
+
     if (supportsType("audio/mpeg")) {
       const rec = new MediaRecorder(destRef.current.stream, { mimeType: "audio/mpeg" });
       chunksRef.current = [];
       rec.ondataavailable = (e) => { if (e.data.size) chunksRef.current.push(e.data); };
       rec.onstop = () => {
         const blob = new Blob(chunksRef.current, { type: "audio/mpeg" });
-        const url = URL.createObjectURL(blob);
-        downloadBlob(url, "ghostbox-mix.mp3");
+        downloadBlob(URL.createObjectURL(blob), "ghostbox-mix.mp3");
       };
       rec.start();
       recRef.current = rec;
@@ -539,19 +528,16 @@ export default function Page() {
       return;
     }
 
-    // 2) Fallback WAV (capture PCM via ScriptProcessorNode)
+    // Fallback WAV (ScriptProcessor)
     const ctx = ctxRef.current;
     const proc = ctx.createScriptProcessor(4096, 2, 2);
     wavRecRef.current = { active: true, proc, buffersL: [], buffersR: [], length: 0 };
-    // on « tape » le bus d’enregistrement (recordMix) pour récupérer le PCM
     recordMixRef.current.connect(proc);
-    // on connecte le processeur à la sortie sans rien écrire (silence) pour le garder actif
     proc.connect(ctx.destination);
     proc.onaudioprocess = (e) => {
       if (!wavRecRef.current.active) return;
       const inL = e.inputBuffer.getChannelData(0);
       const inR = e.inputBuffer.numberOfChannels > 1 ? e.inputBuffer.getChannelData(1) : inL;
-      // copie les frames (Float32)
       wavRecRef.current.buffersL.push(new Float32Array(inL));
       wavRecRef.current.buffersR.push(new Float32Array(inR));
       wavRecRef.current.length += inL.length;
@@ -560,15 +546,12 @@ export default function Page() {
   }
 
   function stopRecording() {
-    // MP3 natif ?
+    // MP3
     if (recRef.current && recRef.current.state !== "inactive") {
       try { recRef.current.stop(); } catch {}
-      recRef.current = null;
-      setEnr(false);
-      return;
+      recRef.current = null; setEnr(false); return;
     }
-
-    // WAV fallback
+    // WAV
     if (!wavRecRef.current.active) return;
     wavRecRef.current.active = false;
     try { recordMixRef.current.disconnect(wavRecRef.current.proc); } catch {}
@@ -577,20 +560,13 @@ export default function Page() {
     const { buffersL, buffersR, length } = wavRecRef.current;
     const ctx = ctxRef.current;
     const rate = ctx?.sampleRate || 48000;
-
-    // concat
     const L = new Float32Array(length);
     const R = new Float32Array(length);
     let off = 0;
-    for (let i = 0; i < buffersL.length; i++) {
-      L.set(buffersL[i], off);
-      R.set(buffersR[i], off);
-      off += buffersL[i].length;
-    }
+    for (let i = 0; i < buffersL.length; i++) { L.set(buffersL[i], off); R.set(buffersR[i], off); off += buffersL[i].length; }
     const wav = encodeWAV(L, R, rate);
     const blob = new Blob([wav], { type: "audio/wav" });
-    const url = URL.createObjectURL(blob);
-    downloadBlob(url, "ghostbox-mix.wav");
+    downloadBlob(URL.createObjectURL(blob), "ghostbox-mix.wav");
     setEnr(false);
   }
 
@@ -601,28 +577,23 @@ export default function Page() {
     setTimeout(() => { document.body.removeChild(a); URL.revokeObjectURL(url); }, 0);
   }
 
-  // Encodeur WAV (stéréo 16-bit PCM)
   function encodeWAV(left, right, sampleRate) {
     const numFrames = left.length;
     const buffer = new ArrayBuffer(44 + numFrames * 4);
     const view = new DataView(buffer);
-
-    /* RIFF/WAVE header */
     writeString(view, 0, "RIFF");
     view.setUint32(4, 36 + numFrames * 4, true);
     writeString(view, 8, "WAVE");
     writeString(view, 12, "fmt ");
-    view.setUint32(16, 16, true);             // Subchunk1Size (16 for PCM)
-    view.setUint16(20, 1, true);              // AudioFormat (1=PCM)
-    view.setUint16(22, 2, true);              // NumChannels
-    view.setUint32(24, sampleRate, true);     // SampleRate
-    view.setUint32(28, sampleRate * 4, true); // ByteRate (SampleRate * BlockAlign)
-    view.setUint16(32, 4, true);              // BlockAlign (NumChannels * BytesPerSample)
-    view.setUint16(34, 16, true);             // BitsPerSample
+    view.setUint32(16, 16, true);
+    view.setUint16(20, 1, true);
+    view.setUint16(22, 2, true);
+    view.setUint32(24, sampleRate, true);
+    view.setUint32(28, sampleRate * 4, true);
+    view.setUint16(32, 4, true);
+    view.setUint16(34, 16, true);
     writeString(view, 36, "data");
-    view.setUint32(40, numFrames * 4, true);  // Subchunk2Size
-
-    // PCM data
+    view.setUint32(40, numFrames * 4, true);
     floatTo16BitPCM(view, 44, left, right);
     return view;
   }
@@ -637,9 +608,7 @@ export default function Page() {
     }
   }
 
-  /* =========================
-     Réactions contrôles & UI
-  ==========================*/
+  /* ===== Réactions contrôles ===== */
   useEffect(() => {
     if (masterRef.current) masterRef.current.gain.value = clamp01(volume);
     if (audioElRef.current && compat) audioElRef.current.volume = clamp01(volume);
@@ -659,7 +628,7 @@ export default function Page() {
 
   function toggleEnr() { if (!enr) startRecording(); else stopRecording(); }
 
-  // ------- UI -------
+  /* ===== UI ===== */
   const list = stationsRef.current;
   const current = list[idxRef.current];
   const currentName = current?.name || (current?.url ? new URL(current.url).host : "");
@@ -670,7 +639,6 @@ export default function Page() {
         <div style={styles.cabinet}>
           <div style={styles.textureOverlay} />
 
-          {/* En-tête */}
           <div style={styles.headerBar}>
             <div style={styles.brandPlate}>
               <div style={styles.brandText}>MADAME FANTÔMES</div>
@@ -686,21 +654,15 @@ export default function Page() {
             </div>
           </div>
 
-          {/* Cadran / état */}
           <div style={styles.glass}>
             <div style={styles.stationRow}>
               <div><strong>{currentName || "—"}</strong></div>
               <div><em style={{ opacity: 0.9 }}>{etat}</em></div>
             </div>
-            {compat && (
-              <div style={styles.compatBanner}>Compat CORS : traitement radio limité</div>
-            )}
-            {micErr && (
-              <div style={styles.warnBanner}>Micro : {micErr}</div>
-            )}
+            {compat && <div style={styles.compatBanner}>Compat : radio non câblée (CORS), mais captureStream tenté pour le REC.</div>}
+            {micErr && <div style={styles.warnBanner}>Micro : {micErr}</div>}
           </div>
 
-          {/* Contrôles */}
           <div style={styles.controlsRow}>
             <div style={styles.switches}>
               <Switch label="MARCHE" on={marche} onChange={async v => { setMarche(v); v ? await powerOn() : await powerOff(); }} />
@@ -724,13 +686,13 @@ export default function Page() {
       </div>
 
       <p style={{ color: "rgba(255,255,255,0.8)", marginTop: 10, fontSize: 12 }}>
-        MP3 est utilisé si supporté par ton navigateur. Sinon, enregistrement WAV (qualité max). Le micro est mixé seulement dans le REC (pas dans les HP).
+        L’enregistrement mélange toujours Ghostbox + Micro dans un seul fichier (MP3 si possible, sinon WAV).
       </p>
     </main>
   );
 }
 
-/* ------- UI widgets ------- */
+/* ===== UI widgets & styles ===== */
 
 function Knob({ label, value, onChange, hint }) {
   const [drag, setDrag] = useState(null);
@@ -780,123 +742,52 @@ function Vis({ at }) {
   return <div style={{ ...decor.screw, ...pos }} />;
 }
 
-/* ------- Styles ------- */
-
 const styles = {
-  page: {
-    minHeight: "100vh",
-    background: "linear-gradient(180deg,#1b2432 0%,#0f1723 60%,#0a0f18 100%)",
-    display: "grid", placeItems: "center", padding: 24
-  },
+  page: { minHeight: "100vh", background: "linear-gradient(180deg,#1b2432 0%,#0f1723 60%,#0a0f18 100%)", display: "grid", placeItems: "center", padding: 24 },
   shadowWrap: { position: "relative" },
   cabinet: {
-    width: "min(980px, 94vw)",
-    borderRadius: 26,
-    padding: 16,
+    width: "min(980px, 94vw)", borderRadius: 26, padding: 16,
     border: "1px solid rgba(48,42,36,0.55)",
     boxShadow: "0 30px 88px rgba(0,0,0,0.65), inset 0 0 0 1px rgba(255,255,255,0.04)",
-    backgroundImage: "url('/skin-watercolor.svg')",
-    backgroundSize: "cover",
-    backgroundPosition: "center",
-    backgroundBlendMode: "multiply",
-    position: "relative",
-    overflow: "hidden"
+    backgroundImage: "url('/skin-watercolor.svg')", backgroundSize: "cover", backgroundPosition: "center", backgroundBlendMode: "multiply",
+    position: "relative", overflow: "hidden"
   },
-  textureOverlay: {
-    position: "absolute",
-    inset: 0,
-    pointerEvents: "none",
-    background:
-      "radial-gradient(circle at 30% 20%, rgba(255,255,255,0.06), rgba(255,255,255,0) 60%)," +
-      "radial-gradient(circle at 70% 70%, rgba(0,0,0,0.12), rgba(0,0,0,0) 55%)"
-  },
+  textureOverlay: { position: "absolute", inset: 0, pointerEvents: "none",
+    background: "radial-gradient(circle at 30% 20%, rgba(255,255,255,0.06), rgba(255,255,255,0) 60%), radial-gradient(circle at 70% 70%, rgba(0,0,0,0.12), rgba(0,0,0,0) 55%)" },
   headerBar: { display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 12 },
-  brandPlate: {
-    background: "linear-gradient(180deg,#2a2f36,#1c2129)",
-    color: "#efe6d2",
-    borderRadius: 12,
-    border: "1px solid #2a2e36",
-    padding: "10px 14px",
-    boxShadow: "inset 0 0 20px rgba(0,0,0,0.45)"
-  },
+  brandPlate: { background: "linear-gradient(180deg,#2a2f36,#1c2129)", color: "#efe6d2", borderRadius: 12, border: "1px solid #2a2e36", padding: "10px 14px", boxShadow: "inset 0 0 20px rgba(0,0,0,0.45)" },
   brandText: { fontFamily: "Georgia,serif", fontWeight: 800, letterSpacing: 1.5, fontSize: 14 },
   brandSub: { fontFamily: "Georgia,serif", fontSize: 12, opacity: 0.8 },
-
   rightHeader: { display: "flex", alignItems: "center", gap: 12 },
   lampsRow: { display: "flex", gap: 14, alignItems: "center" },
-
-  glass: {
-    borderRadius: 16,
-    border: "1px solid rgba(35,45,60,0.9)",
-    background: "linear-gradient(180deg, rgba(168,201,210,0.55), rgba(58,88,110,0.6))",
-    padding: 12, position: "relative", overflow: "hidden",
-    boxShadow: "inset 0 0 32px rgba(0,0,0,0.55)"
-  },
+  glass: { borderRadius: 16, border: "1px solid rgba(35,45,60,0.9)", background: "linear-gradient(180deg, rgba(168,201,210,0.55), rgba(58,88,110,0.6))", padding: 12, position: "relative", overflow: "hidden", boxShadow: "inset 0 0 32px rgba(0,0,0,0.55)" },
   stationRow: { display: "flex", justifyContent: "space-between", color: "#f3efe6", fontSize: 13, padding: "2px 2px" },
-
-  compatBanner: {
-    position: "absolute", right: 10, bottom: 10,
-    background: "rgba(240,180,60,0.18)", border: "1px solid rgba(240,180,60,0.35)",
-    color: "#f0c572", padding: "6px 10px", borderRadius: 8, fontSize: 12
-  },
-  warnBanner: {
-    position: "absolute", left: 10, bottom: 10,
-    background: "rgba(255,80,80,0.18)", border: "1px solid rgba(255,80,80,0.35)",
-    color: "#ff8c8c", padding: "6px 10px", borderRadius: 8, fontSize: 12
-  },
-
+  compatBanner: { position: "absolute", right: 10, bottom: 10, background: "rgba(240,180,60,0.18)", border: "1px solid rgba(240,180,60,0.35)", color: "#f0c572", padding: "6px 10px", borderRadius: 8, fontSize: 12 },
+  warnBanner: { position: "absolute", left: 10, bottom: 10, background: "rgba(255,80,80,0.18)", border: "1px solid rgba(255,80,80,0.35)", color: "#ff8c8c", padding: "6px 10px", borderRadius: 8, fontSize: 12 },
   controlsRow: { marginTop: 16, display: "grid", gridTemplateColumns: "1fr 2fr", gap: 14, alignItems: "center" },
   switches: { display: "grid", gap: 10, alignContent: "start" },
-  knobs: {
-    display: "grid",
-    gridTemplateColumns: "repeat(4, minmax(120px, 1fr))",
-    gap: 14,
-    alignItems: "center",
-    justifyItems: "center"
-  }
+  knobs: { display: "grid", gridTemplateColumns: "repeat(4, minmax(120px, 1fr))", gap: 14, alignItems: "center", justifyItems: "center" }
 };
-
 const ui = {
   knobBlock: { display: "grid", justifyItems: "center" },
   knob: {
     width: 100, height: 100, borderRadius: "50%",
     background: "radial-gradient(circle at 32% 28%, #6d6f79, #3a3f4a 62%, #1b2230 100%)",
-    border: "1px solid rgba(28,30,38,0.9)",
-    boxShadow: "inset 0 12px 30px rgba(0,0,0,0.55), 0 8px 26px rgba(0,0,0,0.45)",
-    display: "grid", placeItems: "center",
-    touchAction: "none", userSelect: "none", cursor: "grab"
+    border: "1px solid rgba(28,30,38,0.9)", boxShadow: "inset 0 12px 30px rgba(0,0,0,0.55), 0 8px 26px rgba(0,0,0,0.45)",
+    display: "grid", placeItems: "center", touchAction: "none", userSelect: "none", cursor: "grab"
   },
   knobIndicator: { width: 8, height: 34, borderRadius: 4, background: "#e1b66f", boxShadow: "0 0 10px rgba(225,182,111,0.45)" },
   knobLabel: { color: "#f0eadc", marginTop: 6, fontSize: 13, letterSpacing: 1.2, textAlign: "center", fontFamily: "Georgia,serif" },
   hint: { color: "rgba(255,255,255,0.7)", fontSize: 11, marginTop: 2 },
-
   switchBlock: { display: "grid", gridTemplateColumns: "auto 1fr", alignItems: "center", gap: 10, cursor: "pointer" },
   switchLabel: { color: "#f0eadc", fontSize: 12, letterSpacing: 1.2, fontFamily: "Georgia,serif" },
   switch: { width: 64, height: 26, borderRadius: 16, position: "relative", border: "1px solid rgba(40,44,56,0.9)", background: "linear-gradient(180deg,#2a2f36,#20252d)" },
   switchDot: { width: 24, height: 24, borderRadius: "50%", background: "#10151c", border: "1px solid #2b2f39", position: "absolute", top: 1, left: 1, transition: "transform .15s" },
-
-  button: {
-    cursor: "pointer",
-    border: "1px solid rgba(60,48,38,0.8)",
-    borderRadius: 12,
-    padding: "10px 14px",
-    fontWeight: 800,
-    fontSize: 13,
-    color: "#0b0b10",
-    boxShadow: "0 6px 18px rgba(0,0,0,0.35)",
-    background: "#d96254"
-  },
-
+  button: { cursor: "pointer", border: "1px solid rgba(60,48,38,0.8)", borderRadius: 12, padding: "10px 14px", fontWeight: 800, fontSize: 13, color: "#0b0b10", boxShadow: "0 6px 18px rgba(0,0,0,0.35)", background: "#d96254" },
   lamp: { display: "grid", gridTemplateColumns: "auto auto", gap: 6, alignItems: "center" },
   lampDot: { width: 12, height: 12, borderRadius: "50%" },
   lampLabel: { color: "#efe6d2", fontSize: 11, letterSpacing: 1, fontFamily: "Georgia,serif" }
 };
-
 const decor = {
-  screw: {
-    position: "absolute", width: 18, height: 18, borderRadius: "50%",
-    background: "radial-gradient(circle at 30% 30%, #9aa0ad, #4b515e 60%, #1e232d)",
-    border: "1px solid #222834",
-    boxShadow: "0 8px 20px rgba(0,0,0,0.5), inset 0 3px 8px rgba(0,0,0,0.6)"
-  }
+  screw: { position: "absolute", width: 18, height: 18, borderRadius: "50%", background: "radial-gradient(circle at 30% 30%, #9aa0ad, #4b515e 60%, #1e232d)", border: "1px solid #222834", boxShadow: "0 8px 20px rgba(0,0,0,0.5), inset 0 3px 8px rgba(0,0,0,0.6)" }
 };
