@@ -2,20 +2,19 @@
 
 /**
  * Ghostbox TCI — FR
- * - AUCUN compteur de stations affiché (badge supprimé)
- * - Bruit de balayage modulé & plus doux (HP→BP→LP + jitter + wobble)
- * - Souffle de fond discret (quand MARCHE = ON)
- * - ENREGISTRER (.webm)
- * - Balayage AUTO + skip des flux HS (timeout)
- * - Filtre radio “TCI” auto (HP/LP/Shelf + petite saturation) si CORS permet WebAudio
+ * - Bruit de fond très discret (loin derrière la radio)
+ * - Burst de balayage adouci/plafonné
+ * - Ducking auto : quand la radio joue, le bruit retombe au plancher
+ * - ENREGISTRER (.webm), Balayage AUTO + skip flux HS (timeout)
+ * - Filtre radio “TCI” auto (si WebAudio autorisé), pas d’affichage du nombre de stations
  * - Charge /public/stations.json sinon fallback
  */
 
 import React, { useEffect, useRef, useState } from "react";
 
-const AUTO_FILTER = true; // filtre radio “TCI” appliqué quand possible (WebAudio)
+const AUTO_FILTER = true;
 
-// ------- Fallback si /stations.json absent -------
+// ------- Fallback -------
 const FALLBACK_STATIONS = [
   "https://icecast.radiofrance.fr/fip-midfi.mp3",
   "https://icecast.radiofrance.fr/fiprock-midfi.mp3",
@@ -75,9 +74,9 @@ export default function Page() {
 
   // Contrôles
   const [vitesse, setVitesse] = useState(0.45); // 250..2500 ms
-  const [volume, setVolume] = useState(0.9);
-  const [echo, setEcho] = useState(0.3); // mix + fb
-  const [debit, setDebit] = useState(0.5); // douceur par défaut
+  const [volume, setVolume]  = useState(0.9);
+  const [echo, setEcho]      = useState(0.3);   // mix + fb
+  const [debit, setDebit]    = useState(0.4);   // plus doux par défaut
 
   // Enregistrement
   const [enr, setEnr] = useState(false);
@@ -87,9 +86,9 @@ export default function Page() {
   // Helpers
   const clamp01 = (x) => Math.max(0, Math.min(1, x));
   const msFromSpeed = (v) => Math.round(250 + v * (2500 - 250)); // 250..2500
-  const BASE_NOISE = 0.025; // souffle de fond discret
-  const burstMs = () => Math.round(120 + debit * 520); // 120..640 ms
-  const burstGain = () => 0.18 + debit * 0.65; // moins agressif
+  const BASE_NOISE = 0.006;                 // << bruit de fond très faible
+  const burstMs  = () => Math.round(120 + debit * 520); // 120..640 ms
+  const burstGain = () => Math.min(0.40, 0.08 + debit * 0.32); // plafonné à ~0.40
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
   // ------- Charger /stations.json -------
@@ -97,55 +96,30 @@ export default function Page() {
     (async () => {
       try {
         const r = await fetch("/stations.json", { cache: "no-store" });
-        if (!r.ok) throw new Error("stations.json introuvable");
-        const json = await r.json();
-        const flat = normalizeStationsJson(json);
-        if (flat.length) {
-          setStations(flat);
-          stationsRef.current = flat;
-          idxRef.current = 0; setIdx(0);
-          return;
-        }
-      } catch {
-        stationsRef.current = FALLBACK_STATIONS;
-      }
+        if (!r.ok) throw new Error();
+        const flat = normalizeStationsJson(await r.json());
+        if (flat.length) { setStations(flat); stationsRef.current = flat; idxRef.current = 0; setIdx(0); }
+      } catch { stationsRef.current = FALLBACK_STATIONS; }
     })();
   }, []);
 
   function normalizeStationsJson(json) {
     let list = [];
-    const push = (name, url, suffix = "") => {
+    const push = (name, url, suffix="") => {
       if (!url || typeof url !== "string") return;
       if (!/^https:/i.test(url)) return;
-      try {
-        url = url.trim();
-        const nm = (name && name.trim()) || new URL(url).host + suffix;
-        list.push({ name: nm, url });
-      } catch {}
+      try { url = url.trim(); list.push({ name: (name && name.trim()) || new URL(url).host + suffix, url }); } catch {}
     };
     if (Array.isArray(json)) {
-      json.forEach((s) => {
-        if (!s) return;
-        if (s.url) push(s.name, s.url);
-        if (Array.isArray(s.urls)) s.urls.forEach((u, k) => push(s.name, u, ` #${k + 1}`));
-      });
+      json.forEach(s => { if (!s) return; if (s.url) push(s.name, s.url); if (Array.isArray(s.urls)) s.urls.forEach((u,k)=>push(s.name,u,` #${k+1}`)); });
     } else if (json && typeof json === "object") {
-      Object.entries(json).forEach(([group, arr]) => {
-        if (!Array.isArray(arr)) return;
-        arr.forEach((s) => {
-          if (!s) return;
-          if (s.url) push(s.name || group, s.url);
-          if (Array.isArray(s.urls)) s.urls.forEach((u, k) => push(s.name || group, u, ` #${k + 1}`));
-        });
-      });
+      Object.entries(json).forEach(([group, arr]) => Array.isArray(arr) && arr.forEach(s => {
+        if (!s) return; if (s.url) push(s.name||group, s.url); if (Array.isArray(s.urls)) s.urls.forEach((u,k)=>push(s.name||group,u,` #${k+1}`));
+      }));
     }
     const seen = new Set();
-    list = list.filter((s) => (seen.has(s.url) ? false : seen.add(s.url)));
-    // mélange léger
-    for (let i = list.length - 1; i > 0; i--) {
-      const j = Math.floor(Math.random() * (i + 1));
-      [list[i], list[j]] = [list[j], list[i]];
-    }
+    list = list.filter(s => (seen.has(s.url) ? false : seen.add(s.url)));
+    for (let i=list.length-1;i>0;i--){const j=Math.floor(Math.random()*(i+1));[list[i],list[j]]=[list[j],list[i]];}
     return list;
   }
 
@@ -169,12 +143,12 @@ export default function Page() {
     // Bruit (HP→BP→LP→Gain)
     const noise = createNoiseNode(ctx); noiseNodeRef.current = noise;
     const hpN = ctx.createBiquadFilter(); hpN.type = "highpass"; hpN.frequency.value = 160; hpN.Q.value = 0.7;
-    const bp = ctx.createBiquadFilter(); bp.type = "bandpass"; bp.Q.value = 0.55; bp.frequency.value = 1800;
-    const lpN = ctx.createBiquadFilter(); lpN.type = "lowpass"; lpN.frequency.value = 6500; lpN.Q.value = 0.3;
+    const bp  = ctx.createBiquadFilter(); bp.type = "bandpass"; bp.Q.value = 0.55; bp.frequency.value = 1800;
+    const lpN = ctx.createBiquadFilter(); lpN.type = "lowpass";  lpN.frequency.value = 5200; lpN.Q.value = 0.3; // un peu plus sombre
     noiseHPRef.current = hpN; noiseFilterRef.current = bp; noiseLPRef.current = lpN;
     const gNoise = ctx.createGain(); gNoise.gain.value = 0; noiseGainRef.current = gNoise;
 
-    // Radio auto-filtre (HP / LP / shelf + drive)
+    // Radio auto-filtre
     const hp = ctx.createBiquadFilter();  hp.type = "highpass"; hp.frequency.value = 320; hp.Q.value = 0.7;
     const lp = ctx.createBiquadFilter();  lp.type = "lowpass";  lp.frequency.value = 3400; lp.Q.value = 0.7;
     const shelf = ctx.createBiquadFilter(); shelf.type = "highshelf"; shelf.frequency.value = 2500; shelf.gain.value = -4;
@@ -189,15 +163,16 @@ export default function Page() {
     const wet = ctx.createGain(); wet.gain.value = 0;
     echoDelayRef.current = dly; echoFbRef.current = fb; echoWetRef.current = wet;
 
-    // “clic” bus
+    // “clic”
     const clickBus = ctx.createGain(); clickBus.gain.value = 0; clickBus.connect(master);
     clickBusRef.current = clickBus;
 
     // Somme → master
     const sum = ctx.createGain(); sum.gain.value = 1;
-    // radio branchée plus tard (attachMedia), soit via filtre, soit direct → gRadio → sum
     // bruit : noise → HP → BP → LP → gNoise → sum
     noise.connect(hpN); hpN.connect(bp); bp.connect(lpN); lpN.connect(gNoise); gNoise.connect(sum);
+    // radio branchée plus tard (attachMedia) → gRadio → sum
+    gRadio.connect(sum);
 
     sum.connect(dry);  dry.connect(master);
     sum.connect(dly);  dly.connect(wet); wet.connect(master);
@@ -216,27 +191,20 @@ export default function Page() {
 
   // légère saturation
   function createDriveNode(ctx, amount = 0.25) {
-    const ws = ctx.createWaveShaper();
-    ws.curve = makeDistortionCurve(amount);
-    ws.oversample = "4x";
-    return ws;
+    const ws = ctx.createWaveShaper(); ws.curve = makeDistortionCurve(amount); ws.oversample = "4x"; return ws;
   }
   function makeDistortionCurve(amount = 0.25) {
     const k = amount * 100, n = 44100, curve = new Float32Array(n);
-    for (let i = 0; i < n; i++) {
-      const x = (i * 2) / n - 1;
-      curve[i] = ((1 + k) * x) / (1 + k * Math.abs(x));
-    }
+    for (let i = 0; i < n; i++) { const x = (i * 2) / n - 1; curve[i] = ((1 + k) * x) / (1 + k * Math.abs(x)); }
     return curve;
   }
   function applyAutoFilterProfile() {
-    // petit profil aléatoire par station
     const ctx = ctxRef.current; if (!AUTO_FILTER || !ctx || !radioHPRef.current) return;
     const now = ctx.currentTime;
     const hpF = 260 + Math.random() * 160;      // 260..420 Hz
-    const lpF = 2800 + Math.random() * 1600;    // 2.8..4.4 kHz
+    const lpF = 2800 + Math.random() * 1400;    // 2.8..4.2 kHz (un poil plus sombre)
     const shelfGain = -(2 + Math.random() * 5); // -2..-7 dB
-    const driveAmt = 0.18 + Math.random() * 0.14;
+    const driveAmt = 0.16 + Math.random() * 0.12; // un peu moins de drive
     try {
       radioHPRef.current.frequency.setTargetAtTime(hpF, now, 0.08);
       radioLPRef.current.frequency.setTargetAtTime(lpF, now, 0.08);
@@ -262,6 +230,16 @@ export default function Page() {
       } else {
         src.connect(radioGainRef.current);
       }
+
+      // --- Ducking auto du bruit quand la radio joue ---
+      const el = audioElRef.current;
+      const duckToFloor = () => {
+        const now = ctxRef.current.currentTime;
+        try { noiseGainRef.current.gain.cancelScheduledValues(now);
+              noiseGainRef.current.gain.setTargetAtTime(BASE_NOISE, now, 0.12); } catch {}
+      };
+      el.addEventListener("playing", duckToFloor);
+      el.addEventListener("timeupdate", duckToFloor);
 
       setCompat(false);
     } catch {
@@ -292,23 +270,18 @@ export default function Page() {
     playingLockRef.current = false;
   }
 
-  // petit “clic” de commutation
-  function triggerClick(level = 0.35) {
+  // petit “clic” discret
+  function triggerClick(level = 0.28) {
     const ctx = ctxRef.current; if (!ctx || !clickBusRef.current) return;
-    const dur = 0.015;
+    const dur = 0.012;
     const buf = ctx.createBuffer(1, Math.max(1, Math.floor(dur * ctx.sampleRate)), ctx.sampleRate);
     const d = buf.getChannelData(0);
-    for (let i = 0; i < d.length; i++) d[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / d.length, 12);
+    for (let i = 0; i < d.length; i++) d[i] = (Math.random()*2-1) * Math.pow(1 - i/d.length, 12);
     const src = ctx.createBufferSource(); src.buffer = buf;
-    const g = clickBusRef.current;
-    const now = ctx.currentTime;
-    try {
-      g.gain.cancelScheduledValues(now);
-      g.gain.setValueAtTime(level, now);
-      g.gain.exponentialRampToValueAtTime(0.0001, now + dur);
-    } catch {}
-    src.connect(g);
-    src.start();
+    const g = clickBusRef.current; const now = ctx.currentTime;
+    try { g.gain.cancelScheduledValues(now); g.gain.setValueAtTime(level, now);
+          g.gain.exponentialRampToValueAtTime(0.0001, now + dur); } catch {}
+    src.connect(g); src.start();
   }
 
   // éclaboussure de bruit modulée (balayage)
@@ -316,25 +289,23 @@ export default function Page() {
     const ctx = ctxRef.current; if (!ctx) return;
     const now = ctx.currentTime;
 
-    const bp = noiseFilterRef.current;
-    const hp = noiseHPRef.current;
-    const lp = noiseLPRef.current;
+    const bp = noiseFilterRef.current, hp = noiseHPRef.current, lp = noiseLPRef.current;
     const g = noiseGainRef.current?.gain;
 
-    // couleur selon DÉBIT
-    const q = 0.35 + debit * 0.5;          // 0.35..0.85
-    const lpF = 4800 + debit * 2200;       // 4.8..7.0 kHz
-    const hpF = 180 + debit * 220;         // 180..400 Hz
+    // couleur selon DÉBIT (encore adoucie)
+    const q   = 0.35 + debit * 0.45;    // 0.35..0.80
+    const lpF = 4200 + debit * 1600;    // 4.2..5.8 kHz (plus sombre)
+    const hpF = 160  + debit * 180;     // 160..340 Hz
     try {
       bp.Q.setTargetAtTime(q, now, 0.05);
       lp.frequency.setTargetAtTime(lpF, now, 0.08);
       hp.frequency.setTargetAtTime(hpF, now, 0.08);
     } catch {}
 
-    // glissando organique + jitter
-    const fStart = 900 + Math.random() * 900;   // 0.9–1.8 kHz
-    const fMid   = 1400 + Math.random() * 1900; // 1.4–3.3 kHz
-    const fEnd   = 2200 + Math.random() * 2200; // 2.2–4.4 kHz
+    // glissando + jitter doux
+    const fStart = 800  + Math.random()*800;   // 0.8–1.6 kHz
+    const fMid   = 1300 + Math.random()*1500;  // 1.3–2.8 kHz
+    const fEnd   = 1800 + Math.random()*1800;  // 1.8–3.6 kHz
     const steps  = Math.max(4, Math.floor(durSec * 10));
     for (let i = 0; i <= steps; i++) {
       const t = now + (durSec * i) / steps;
@@ -342,27 +313,27 @@ export default function Page() {
       const f = (x < 0.6)
         ? fStart + (fMid - fStart) * (x / 0.6)
         : fMid   + (fEnd - fMid)   * ((x - 0.6) / 0.4);
-      const jitter = (Math.random() * 2 - 1) * (120 + 600 * (1 - debit));
+      const jitter = (Math.random()*2 - 1) * (80 + 380*(1 - debit));
       try { bp.frequency.linearRampToValueAtTime(Math.max(300, f + jitter), t); } catch {}
     }
 
-    // enveloppe d’amplitude avec petites vagues (wobble)
+    // enveloppe très modeste + petites vagues
     try {
       g.cancelScheduledValues(now);
-      const attack = Math.min(0.06, durSec * 0.25);
+      const attack = Math.min(0.05, durSec * 0.22);
       g.setValueAtTime(BASE_NOISE, now);
-      g.linearRampToValueAtTime(targetGain * (0.6 + 0.2 * Math.random()), now + attack);
+      g.linearRampToValueAtTime(targetGain * (0.42 + 0.12*Math.random()), now + attack);
 
-      const wobbleN = Math.max(2, Math.floor(durSec / 0.08));
-      for (let i = 1; i <= wobbleN; i++) {
+      const wobbleN = Math.max(2, Math.floor(durSec / 0.1));
+      for (let i=1;i<=wobbleN;i++){
         const t = now + attack + (durSec - attack) * (i / wobbleN);
-        const lvl = targetGain * (0.55 + 0.35 * Math.random());
+        const lvl = targetGain * (0.38 + 0.22*Math.random());
         g.linearRampToValueAtTime(lvl, t);
       }
     } catch {}
   }
 
-  // ------- Lecture robuste (burst + clic + timeout + skip) -------
+  // ------- Lecture robuste -------
   async function playIndex(startIndex, tries = 0) {
     const list = stationsRef.current;
     if (!list.length) return;
@@ -379,15 +350,13 @@ export default function Page() {
     const dur = burstMs() / 1000;
     const targetNoise = burstGain();
 
-    // 1) clic + montée du bruit modulé, on baisse la radio
-    triggerClick(0.35);
+    // 1) clic + montée du bruit, radio vers 0
+    triggerClick();
     try {
       if (!compat) {
         radioGainRef.current.gain.cancelScheduledValues(now);
         radioGainRef.current.gain.linearRampToValueAtTime(0.0001, now + 0.05);
-      } else {
-        el.volume = 0;
-      }
+      } else { el.volume = 0; }
     } catch {}
     playScanBurst(targetNoise, dur);
     setEtat("balayage…");
@@ -398,7 +367,6 @@ export default function Page() {
     try {
       el.crossOrigin = "anonymous";
       el.pause(); el.src = url; el.load();
-
       const playP = el.play();
       const timeout = new Promise((_, rej) => setTimeout(() => rej(new Error("timeout")), 3500));
       await Promise.race([playP, timeout]);
@@ -406,7 +374,7 @@ export default function Page() {
       await attachMedia();
       applyAutoFilterProfile();
 
-      // 3) retour : bruit → fond, radio → 1
+      // 3) retour : bruit → très bas, radio → 1
       const after = ctx.currentTime + Math.max(0.08, dur * 0.6);
       try {
         noiseGainRef.current.gain.setTargetAtTime(BASE_NOISE, after, 0.12);
@@ -455,16 +423,13 @@ export default function Page() {
         const blob = new Blob(chunksRef.current, { type: "audio/webm" });
         const url = URL.createObjectURL(blob);
         const a = document.createElement("a");
-        a.href = url; a.download = `ghostbox-${new Date().toISOString().replace(/[:.]/g, "-")}.webm`;
+        a.href = url; a.download = `ghostbox-${new Date().toISOString().replace(/[:.]/g,"-")}.webm`;
         document.body.appendChild(a); a.click();
-        setTimeout(() => { document.body.removeChild(a); URL.revokeObjectURL(url); }, 0);
+        setTimeout(()=>{ document.body.removeChild(a); URL.revokeObjectURL(url); },0);
       };
       rec.start();
       recRef.current = rec; setEnr(true);
-    } else {
-      try { recRef.current?.stop(); } catch {}
-      setEnr(false);
-    }
+    } else { try { recRef.current?.stop(); } catch {} setEnr(false); }
   }
 
   // ------- Réactions contrôles -------
@@ -496,7 +461,7 @@ export default function Page() {
         <div style={styles.cabinet}>
           <div style={styles.textureOverlay} />
 
-          {/* En-tête (SANS compteur) */}
+          {/* En-tête (sans compteur) */}
           <div style={styles.headerBar}>
             <div style={styles.brandPlate}>
               <div style={styles.brandText}>MADAME FANTÔMES</div>
@@ -505,8 +470,8 @@ export default function Page() {
             <div style={styles.rightHeader}>
               <div style={styles.lampsRow}>
                 <Lamp label="MARCHE" on={marche} />
-                <Lamp label="AUTO" on={auto} colorOn="#86fb6a" />
-                <Lamp label="ENR" on={enr} colorOn="#ff5656" />
+                <Lamp label="AUTO"   on={auto} colorOn="#86fb6a" />
+                <Lamp label="ENR"    on={enr}  colorOn="#ff5656" />
               </div>
             </div>
           </div>
@@ -545,7 +510,7 @@ export default function Page() {
       </div>
 
       <p style={{ color: "rgba(255,255,255,0.8)", marginTop: 10, fontSize: 12 }}>
-        Pour un balayage doux et “vieille radio”, règle <strong>DÉBIT</strong> vers 0.3–0.5. Plus haut = plus présent.
+        Si le bruit te gêne encore, baisse <strong>DÉBIT</strong> (0.2–0.4). Le burst reste court et la radio passe devant.
       </p>
     </main>
   );
@@ -601,7 +566,7 @@ function Vis({ at }) {
   return <div style={{ ...decor.screw, ...pos }} />;
 }
 
-/* ------- Styles (aquarelle) ------- */
+/* ------- Styles ------- */
 
 const styles = {
   page: {
