@@ -2,20 +2,19 @@
 
 /**
  * Ghostbox TCI — FR
- * - Balayage "direct" : ne garde que des flux directs (MP3/AAC/OGG), exclut playlists/HLS
- *   et force le live-edge avec un paramètre anti-cache à chaque changement.
- * - Aucun compteur de stations affiché
+ * - Charge /public/stations.json + /public/stations-extra.json et fusionne (dédoublonné)
+ * - Balayage "direct" (on évite HLS/playlists) + live-edge forcé à chaque saut
+ * - Aucun compteur de stations
  * - Bruit de fond très discret + ducking auto quand la radio joue
  * - ENREGISTRER (.webm), Balayage AUTO + skip flux HS (timeout)
  * - Filtre radio “TCI” auto (si WebAudio autorisé)
- * - Charge /public/stations.json sinon fallback
  */
 
 import React, { useEffect, useRef, useState } from "react";
 
 const AUTO_FILTER = true;
 
-// ------- Fallback (flux directs HTTPS) -------
+// ------- Fallback (quelques flux directs HTTPS au cas où) -------
 const FALLBACK_STATIONS = [
   "https://icecast.radiofrance.fr/fip-midfi.mp3",
   "https://icecast.radiofrance.fr/fiprock-midfi.mp3",
@@ -92,52 +91,85 @@ export default function Page() {
   const burstGain = () => Math.min(0.40, 0.08 + debit * 0.32); // intensité plafonnée
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-  // ------- Charger /stations.json -------
+  // ------- Charger /stations.json + /stations-extra.json -------
   useEffect(() => {
     (async () => {
+      const all = [];
       try {
         const r = await fetch("/stations.json", { cache: "no-store" });
-        if (!r.ok) throw new Error();
-        const flat = normalizeStationsJson(await r.json());
-        if (flat.length) { setStations(flat); stationsRef.current = flat; idxRef.current = 0; setIdx(0); }
-      } catch { stationsRef.current = FALLBACK_STATIONS; }
+        if (r.ok) all.push(...normalizeStationsJson(await r.json()));
+      } catch {}
+      try {
+        const r2 = await fetch("/stations-extra.json", { cache: "no-store" });
+        if (r2.ok) all.push(...normalizeStationsJson(await r2.json()));
+      } catch {}
+
+      let flat = all;
+      if (!flat.length) flat = FALLBACK_STATIONS;
+
+      // dédoublonnage final par URL
+      const seen = new Set();
+      flat = flat.filter((s) => (s && s.url && !seen.has(s.url) ? (seen.add(s.url), true) : false));
+
+      setStations(flat);
+      stationsRef.current = flat;
+      idxRef.current = 0; setIdx(0);
     })();
   }, []);
 
-  // Déplie/stérilise la structure JSON et NE GARDE QUE des flux "directs"
+  // Déplie/stérilise la structure JSON et écarte HLS/playlist/agrégateurs
   function normalizeStationsJson(json) {
     let list = [];
-    const push = (name, url, suffix="") => {
+    const push = (name, url, suffix = "") => {
       if (!url || typeof url !== "string") return;
       if (!/^https:/i.test(url)) return;
-      if (!isDirectStreamURL(url)) return; // <-- direct only (pas HLS/playlist)
-      try { url = url.trim(); list.push({ name: (name && name.trim()) || new URL(url).host + suffix, url }); } catch {}
+      if (!isDirectish(url)) return; // <-- rejette HLS/playlist/agrégateurs
+      try {
+        url = url.trim();
+        const nm = (name && name.trim()) || new URL(url).host + suffix;
+        list.push({ name: nm, url });
+      } catch {}
     };
     if (Array.isArray(json)) {
-      json.forEach(s => { if (!s) return; if (s.url) push(s.name, s.url); if (Array.isArray(s.urls)) s.urls.forEach((u,k)=>push(s.name,u,` #${k+1}`)); });
+      json.forEach((s) => {
+        if (!s) return;
+        if (s.url) push(s.name, s.url);
+        if (Array.isArray(s.urls)) s.urls.forEach((u, k) => push(s.name, u, ` #${k + 1}`));
+      });
     } else if (json && typeof json === "object") {
-      Object.entries(json).forEach(([group, arr]) => Array.isArray(arr) && arr.forEach(s => {
-        if (!s) return; if (s.url) push(s.name||group, s.url); if (Array.isArray(s.urls)) s.urls.forEach((u,k)=>push(s.name||group,u,` #${k+1}`));
-      }));
+      Object.entries(json).forEach(([group, arr]) => {
+        if (!Array.isArray(arr)) return;
+        arr.forEach((s) => {
+          if (!s) return;
+          if (s.url) push(s.name || group, s.url);
+          if (Array.isArray(s.urls)) s.urls.forEach((u, k) => push(s.name || group, u, ` #${k + 1}`));
+        });
+      });
     }
-    const seen = new Set();
-    list = list.filter(s => (seen.has(s.url) ? false : seen.add(s.url)));
-    for (let i=list.length-1;i>0;i--){const j=Math.floor(Math.random()*(i+1));[list[i],list[j]]=[list[j],list[i]];}
+    // mélange léger
+    for (let i = list.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [list[i], list[j]] = [list[j], list[i]];
+    }
     return list;
   }
 
-  // --- Helpers "live" ---
-  function isDirectStreamURL(u) {
+  // --- Helpers "direct" ---
+  // On bloque seulement ce qui est clairement non-direct (HLS, playlists, agrégateurs).
+  // Beaucoup d'URL "directes" n'ont pas d'extension; on les autorise.
+  function isDirectish(u) {
     try {
-      const url = u.toLowerCase();
-      if (/\.(m3u8|m3u|pls|xspf)(\?|$)/.test(url)) return false; // exclut HLS/playlists
-      if (/\.(mp3|aac|m4a|ogg|opus)(\?|$)/.test(url)) return true; // extensions directes
-      // patterns Icecast/SHOUTcast courants ("/mp3", "/aac", "/stream/")
-      if (url.includes("/mp3") || url.includes("/aac") || url.includes("/stream/")) return true;
-      if (url.includes("icecast") || url.includes("shoutcast")) return true;
-      return false;
+      const L = u.toLowerCase();
+      // bloquer HLS / playlists
+      if (/\.(m3u8|m3u|pls|xspf)(\?|$)/.test(L)) return false;
+      // bloquer quelques agrégateurs connus (liens non audio)
+      const bad = ["tunein.", "radio.garden", "streema", "radioline.", "deezer.", "spotify."];
+      if (bad.some((d) => L.includes(d))) return false;
+      // sinon on accepte (extension .mp3/.aac/.ogg ok, endpoints Icecast/SHOUTcast souvent sans extension)
+      return true;
     } catch { return false; }
   }
+
   function withCacheBust(url) {
     const sep = url.includes("?") ? "&" : "?";
     return `${url}${sep}ghostbox_live=${Date.now()}`;
@@ -255,8 +287,10 @@ export default function Page() {
       const el = audioElRef.current;
       const duckToFloor = () => {
         const now = ctxRef.current.currentTime;
-        try { noiseGainRef.current.gain.cancelScheduledValues(now);
-              noiseGainRef.current.gain.setTargetAtTime(BASE_NOISE, now, 0.12); } catch {}
+        try {
+          noiseGainRef.current.gain.cancelScheduledValues(now);
+          noiseGainRef.current.gain.setTargetAtTime(BASE_NOISE, now, 0.12);
+        } catch {}
       };
       el.addEventListener("playing", duckToFloor);
       el.addEventListener("timeupdate", duckToFloor);
@@ -296,11 +330,13 @@ export default function Page() {
     const dur = 0.012;
     const buf = ctx.createBuffer(1, Math.max(1, Math.floor(dur * ctx.sampleRate)), ctx.sampleRate);
     const d = buf.getChannelData(0);
-    for (let i = 0; i < d.length; i++) d[i] = (Math.random()*2-1) * Math.pow(1 - i/d.length, 12);
+    for (let i = 0; i < d.length; i++) d[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / d.length, 12);
     const src = ctx.createBufferSource(); src.buffer = buf;
     const g = clickBusRef.current; const now = ctx.currentTime;
-    try { g.gain.cancelScheduledValues(now); g.gain.setValueAtTime(level, now);
-          g.gain.exponentialRampToValueAtTime(0.0001, now + dur); } catch {}
+    try {
+      g.gain.cancelScheduledValues(now); g.gain.setValueAtTime(level, now);
+      g.gain.exponentialRampToValueAtTime(0.0001, now + dur);
+    } catch {}
     src.connect(g); src.start();
   }
 
@@ -538,7 +574,7 @@ export default function Page() {
       </div>
 
       <p style={{ color: "rgba(255,255,255,0.8)", marginTop: 10, fontSize: 12 }}>
-        Seules les sources “directes” sont balayées. Si une station tarde, on saute automatiquement.
+        Tes deux fichiers sont fusionnés. Les flux non-directs (HLS/playlists) sont écartés automatiquement.
       </p>
     </main>
   );
