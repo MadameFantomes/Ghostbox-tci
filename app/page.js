@@ -1,51 +1,55 @@
 "use client";
 
 /**
- * Ghostbox TCI — Radio Vintage (FR) + compat CORS + image SVG de fond
- * - Stations avec plusieurs URLs (fallback)
- * - Mode compatibilité si CORS bloque WebAudio (la radio joue quand même)
- * - Contrôles FR : MARCHE, RÉGLAGE, VOLUME, BRUIT, FILTRE, BALAYAGE AUTO, VITESSE, ENREGISTRER
+ * Ghostbox TCI — Radio Vintage (FR) • Inspiré des idées Vocibus Mk2
+ * - Banques A/B de stations (FIP/Radio France + Radio Swiss)
+ * - Balayage auto avec JITTER (aléa) pour casser le rythme
+ * - Effets: ÉCHO (temps/retour), RÉVERB (taille/mix)
+ * - Mode compatibilité CORS (si le flux bloque WebAudio)
  * - VU-mètres, enregistrement .webm
- * - Le cabinet affiche /radio-vintage.svg en background
+ * - Fond SVG aquarelle: /radio-vintage.svg
  */
 
 import React, { useEffect, useRef, useState } from "react";
 
-/* ————— Stations (MP3/AAC fiables) ————— */
-const STATIONS = [
-  {
-    name: "FIP (Radio France)",
-    urls: [
+/* ————— Banques de stations —————
+   Chaque station peut avoir plusieurs URLs (fallback MP3/AAC).
+   Les flux Radio France documentés: icecast.radiofrance.fr (MP3/ACC) */
+const BANKS = {
+  A: [
+    { name: "FIP", urls: [
       "https://icecast.radiofrance.fr/fip-midfi.mp3?id=radiofrance",
       "https://icecast.radiofrance.fr/fip-hifi.aac?id=radiofrance"
-    ]
-  },
-  {
-    name: "FIP Groove",
-    urls: [
+    ]},
+    { name: "FIP Rock", urls: [
+      "https://icecast.radiofrance.fr/fiprock-midfi.mp3?id=radiofrance",
+      "https://icecast.radiofrance.fr/fiprock-hifi.aac?id=radiofrance"
+    ]},
+    { name: "FIP Jazz", urls: [
+      "https://icecast.radiofrance.fr/fipjazz-midfi.mp3?id=radiofrance",
+      "https://icecast.radiofrance.fr/fipjazz-hifi.aac?id=radiofrance"
+    ]},
+    { name: "Radio Swiss Jazz", urls: [
+      "https://stream.srg-ssr.ch/srgssr/rsj/aac/96"
+    ]}
+  ],
+  B: [
+    { name: "France Inter", urls: [
+      "https://icecast.radiofrance.fr/franceinter-midfi.mp3?id=radiofrance"
+    ]},
+    { name: "FIP Groove", urls: [
       "https://icecast.radiofrance.fr/fipgroove-midfi.mp3?id=radiofrance",
       "https://icecast.radiofrance.fr/fipgroove-hifi.aac?id=radiofrance"
-    ]
-  },
-  {
-    name: "Radio Swiss Jazz",
-    urls: [
-      "https://stream.srg-ssr.ch/srgssr/rsj/aac/96"
-    ]
-  },
-  {
-    name: "Radio Swiss Classic",
-    urls: [
+    ]},
+    { name: "FIP World", urls: [
+      "https://icecast.radiofrance.fr/fipworld-midfi.mp3?id=radiofrance",
+      "https://icecast.radiofrance.fr/fipworld-hifi.aac?id=radiofrance"
+    ]},
+    { name: "Radio Swiss Classic", urls: [
       "https://stream.srg-ssr.ch/srgssr/rsc/aac/96"
-    ]
-  },
-  {
-    name: "Référence MP3 (RadioMast)",
-    urls: [
-      "https://streams.radiomast.io/reference-mp3"
-    ]
-  }
-];
+    ]}
+  ]
+};
 
 export default function Page() {
   const audioElRef = useRef(null);
@@ -54,30 +58,53 @@ export default function Page() {
   const ctxRef = useRef(null);
   const destRef = useRef(null);
   const masterGainRef = useRef(null);
+
+  // Sommes & traitement
+  const preBusRef = useRef(null);       // somme radio + bruit
+  const bandpassRef = useRef(null);     // filtre
+  const dryGainRef = useRef(null);      // voie directe
+  const echoDelayRef = useRef(null);    // ÉCHO
+  const echoFbRef = useRef(null);
+  const echoWetRef = useRef(null);
+  const reverbConvolverRef = useRef(null); // RÉVERB
+  const reverbWetRef = useRef(null);
+
   const mediaSrcRef = useRef(null);
   const radioGainRef = useRef(null);
   const noiseNodeRef = useRef(null);
   const noiseGainRef = useRef(null);
-  const bandpassRef = useRef(null);
+
   const analyserRef = useRef(null);
 
-  // UI state
-  const [marche, setMarche] = useState(false);
+  // UI
+  const [bank, setBank] = useState("A"); // "A" | "B"
   const [stationIndex, setStationIndex] = useState(0);
+  const [marche, setMarche] = useState(false);
   const [etat, setEtat] = useState("prêt");
 
-  const [volume, setVolume] = useState(0.9); // radio
-  const [bruit, setBruit]   = useState(0.25); // bruit blanc
+  const [volume, setVolume] = useState(0.9);   // radio
+  const [bruit, setBruit]   = useState(0.25);  // bruit blanc
   const [filtre, setFiltre] = useState(true);
   const [q, setQ] = useState(1.2);
   const [fMin, setFMin] = useState(280);
 
+  // Balayage
   const [autoSweep, setAutoSweep] = useState(false);
-  const [vitesse, setVitesse] = useState(0.45); // 0..1 → 300..2000ms
+  const [vitesse, setVitesse] = useState(0.45); // 0..1 -> 300..2000ms
+  const [alea, setAlea] = useState(0.25);       // 0..0.6 => jitter ±%
   const sweepTimerRef = useRef(null);
 
-  // compat CORS
+  // Compat CORS
   const [compat, setCompat] = useState(false);
+
+  // FX
+  const [echoOn, setEchoOn] = useState(false);
+  const [echoTime, setEchoTime] = useState(0.35);     // 0..1 => 80..800ms
+  const [echoFb, setEchoFb] = useState(0.35);         // 0..1 => 0..0.85
+
+  const [revOn, setRevOn] = useState(false);
+  const [revSize, setRevSize] = useState(0.45);       // 0..1 => 0.2..2.5s
+  const [revMix, setRevMix] = useState(0.35);         // 0..1 wet gain
 
   // Enregistrement
   const [enr, setEnr] = useState(false);
@@ -88,62 +115,107 @@ export default function Page() {
   const [vuG, setVuG] = useState(0);
   const [vuD, setVuD] = useState(0);
 
-  // helpers
+  // Helpers
+  const stations = BANKS[bank];
   const clamp01 = (x) => Math.max(0, Math.min(1, x));
-  const msFromSpeed = (v) => Math.round(300 + v * (2000 - 300)); // 300→2000ms
+  const msFromSpeed = (v) => Math.round(300 + v * (2000 - 300));
+  const msEcho = (v) => 0.08 + v * (0.80 - 0.08); // 80..800ms
+  const fbEcho = (v) => Math.min(0.85, v * 0.85);
+  const secRev = (v) => 0.2 + v * (2.5 - 0.2);   // 0.2..2.5s
 
-  /* ————— Init ————— */
+  /* ————— Initialisation ————— */
   async function initAudio() {
     if (ctxRef.current) return;
     const ctx = new (window.AudioContext || window.webkitAudioContext)();
     ctxRef.current = ctx;
 
+    // master
     const master = ctx.createGain();
     master.gain.value = 1;
     master.connect(ctx.destination);
     masterGainRef.current = master;
 
+    // enregistrement
     const dest = ctx.createMediaStreamDestination();
     master.connect(dest);
     destRef.current = dest;
 
+    // somme entrée
+    const pre = ctx.createGain(); pre.gain.value = 1; preBusRef.current = pre;
+
+    // filtre
     const band = ctx.createBiquadFilter();
-    band.type = "bandpass";
-    band.Q.value = q;
-    band.frequency.value = fMin;
+    band.type = "bandpass"; band.Q.value = q; band.frequency.value = fMin;
     bandpassRef.current = band;
 
+    // voie directe
+    const dry = ctx.createGain(); dry.gain.value = 1; dryGainRef.current = dry;
+
+    // ÉCHO (chemin parallèle)
+    const dly = ctx.createDelay(2.0); dly.delayTime.value = msEcho(echoTime);
+    const fb  = ctx.createGain(); fb.gain.value = fbEcho(echoFb);
+    dly.connect(fb); fb.connect(dly);      // boucle de feedback
+    const echoWet = ctx.createGain(); echoWet.gain.value = 0; // activée via setEchoOn
+    echoDelayRef.current = dly; echoFbRef.current = fb; echoWetRef.current = echoWet;
+
+    // RÉVERB (chemin parallèle)
+    const conv = ctx.createConvolver();
+    conv.normalize = true;
+    conv.buffer = makeImpulseResponse(ctx, secRev(revSize), 2.5);
+    const revWet = ctx.createGain(); revWet.gain.value = 0; // activée via setRevOn
+    reverbConvolverRef.current = conv; reverbWetRef.current = revWet;
+
+    // gains radio/bruit
     const gRadio = ctx.createGain(); gRadio.gain.value = volume; radioGainRef.current = gRadio;
     const gNoise = ctx.createGain(); gNoise.gain.value = bruit;  noiseGainRef.current = gNoise;
 
+    // bruit blanc
     const noise = createNoiseNode(ctx); noiseNodeRef.current = noise;
 
-    const analyser = ctx.createAnalyser(); analyser.fftSize = 512;
-    analyserRef.current = analyser;
+    // analyser
+    const analyser = ctx.createAnalyser(); analyser.fftSize = 512; analyserRef.current = analyser;
 
-    rechain(filtre, /*compatMode*/ false);
+    // Routing initial
+    rebuildChain({ compatMode: false });
+
+    // analyser branché sur master
     master.connect(analyser);
     startVuLoop();
   }
 
-  function rechain(useFilter, compatMode) {
-    try { radioGainRef.current?.disconnect(); } catch {}
-    try { noiseGainRef.current?.disconnect(); } catch {}
-    try { bandpassRef.current?.disconnect(); } catch {}
+  function rebuildChain({ compatMode }) {
+    const master = masterGainRef.current;
+    const pre = preBusRef.current;
+    const band = bandpassRef.current;
+    const dry = dryGainRef.current;
+    const dly = echoDelayRef.current, echoWet = echoWetRef.current;
+    const conv = reverbConvolverRef.current, revWet = reverbWetRef.current;
 
-    if (compatMode) {
-      // en compat : seule la voie BRUIT est dans WebAudio (radio non filtrée)
-      noiseGainRef.current.connect(masterGainRef.current);
-      return;
-    }
-    if (useFilter) {
-      radioGainRef.current.connect(bandpassRef.current);
-      noiseGainRef.current.connect(bandpassRef.current);
-      bandpassRef.current.connect(masterGainRef.current);
-    } else {
-      radioGainRef.current.connect(masterGainRef.current);
-      noiseGainRef.current.connect(masterGainRef.current);
-    }
+    // clean
+    [pre, band, dry, dly, echoWet, conv, revWet].forEach(n => { try { n.disconnect(); } catch {} });
+
+    // Entrées vers preBus
+    try { radioGainRef.current.disconnect(); } catch {}
+    try { noiseGainRef.current.disconnect(); } catch {}
+    noiseGainRef.current.connect(pre);
+    if (!compatMode) radioGainRef.current.connect(pre);
+
+    // Sélection de l’entrée chaîne
+    const chainIn = filtre && !compatMode ? band : pre;
+    if (filtre && !compatMode) pre.connect(band);
+
+    // Branches
+    chainIn.connect(dry);       dry.connect(master);          // direct
+    chainIn.connect(dly);       dly.connect(echoWet);         echoWet.connect(master); // écho
+    chainIn.connect(conv);      conv.connect(revWet);         revWet.connect(master);  // réverb
+
+    // FX states
+    echoWet.gain.value = echoOn ? 0.8 : 0.0;
+    dly.delayTime.value = msEcho(echoTime);
+    echoFbRef.current.gain.value = fbEcho(echoFb);
+
+    reverbWetRef.current.gain.value = revOn ? revMix : 0.0;
+    reverbConvolverRef.current.buffer = makeImpulseResponse(ctxRef.current, secRev(revSize), 2.5);
   }
 
   function createNoiseNode(ctx) {
@@ -156,18 +228,47 @@ export default function Page() {
     return src;
   }
 
-  /* ————— Power ————— */
+  // Impulse pour réverb (bruit décay exponentiel)
+  function makeImpulseResponse(ctx, seconds = 1.5, decay = 2.0) {
+    const rate = ctx.sampleRate;
+    const length = Math.max(1, Math.floor(rate * seconds));
+    const impulse = ctx.createBuffer(2, length, rate);
+    for (let ch = 0; ch < 2; ch++) {
+      const data = impulse.getChannelData(ch);
+      for (let i = 0; i < length; i++) {
+        data[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / length, decay);
+      }
+    }
+    return impulse;
+  }
+
+  async function attachMedia() {
+    if (!ctxRef.current || !audioElRef.current) return;
+    if (mediaSrcRef.current) return; // déjà branché
+    try {
+      const src = ctxRef.current.createMediaElementSource(audioElRef.current);
+      mediaSrcRef.current = src;
+      src.connect(radioGainRef.current);
+      setCompat(false);
+      rebuildChain({ compatMode: false });
+    } catch {
+      // CORS bloqué
+      setCompat(true);
+      rebuildChain({ compatMode: true });
+    }
+  }
+
+  /* ————— MARCHE ————— */
   async function marcheOn() {
     await initAudio();
     const ctx = ctxRef.current;
     if (ctx.state === "suspended") await ctx.resume();
     try { noiseNodeRef.current.start(0); } catch {}
-    // ⚠️ on lit d’abord la station, puis on tente de brancher WebAudio
-    await tuneTo(stationIndex);
+    await tuneTo(stationIndex); // lire d’abord
     setMarche(true);
   }
   function marcheOff() {
-    stopSweepTimer();
+    stopSweep();
     if (audioElRef.current) {
       audioElRef.current.pause();
       audioElRef.current.src = "";
@@ -179,82 +280,60 @@ export default function Page() {
 
   /* ————— Tuning ————— */
   async function tuneTo(index) {
-    const el = audioElRef.current;
-    if (!el) return;
+    const el = audioElRef.current; if (!el) return;
+    const { urls } = stations[index];
 
-    const { urls } = STATIONS[index];
     // petit fondu “scan”
     smooth(noiseGainRef.current.gain, Math.max(bruit, 0.28), 0.12);
     if (!compat) smooth(radioGainRef.current.gain, Math.max(0.12, volume * 0.25), 0.12);
 
-    setEtat("connexion…");
+    setEtat(`connexion…`);
     el.crossOrigin = "anonymous";
 
-    // essaie plusieurs URLs
     let ok = false, lastErr = null;
     for (const url of urls) {
       try {
-        el.pause();
-        el.src = url;
-        el.load();
-        el.volume = compat ? clamp01(volume) : 1.0; // en compat, volume via <audio>
-        await el.play(); // nécessite un clic utilisateur antérieur (MARCHE)
-        ok = true;
-        break;
-      } catch (e) {
-        lastErr = e;
-      }
+        el.pause(); el.src = url; el.load();
+        el.volume = compat ? clamp01(volume) : 1.0;
+        await el.play();
+        ok = true; break;
+      } catch (e) { lastErr = e; }
     }
-    if (!ok) {
-      setEtat(`échec (CORS/format)${lastErr?.name ? " : " + lastErr.name : ""}`);
-      return;
-    }
+    if (!ok) { setEtat(`échec (CORS/format)${lastErr?.name ? " : " + lastErr.name : ""}`); return; }
 
-    // Lecture OK → tente de brancher WebAudio (filtre/mix)
-    try {
-      if (!mediaSrcRef.current) {
-        const src = ctxRef.current.createMediaElementSource(el);
-        mediaSrcRef.current = src;
-        src.connect(radioGainRef.current);
-      }
-      setCompat(false);
-      setEtat("lecture");
-      smooth(radioGainRef.current.gain, volume, 0.28);
-      smooth(noiseGainRef.current.gain, bruit, 0.38);
-    } catch {
-      // CORS bloque WebAudio → mode compat : la radio joue sans filtre
-      setCompat(true);
-      rechain(filtre, /*compatMode*/ true);
-      setEtat("lecture (compatibilité)");
-      smooth(noiseGainRef.current.gain, bruit, 0.38);
-    }
+    // Tenter de brancher la radio dans WebAudio (pour FX/filtre)
+    await attachMedia();
+
+    setEtat(compat ? "lecture (compatibilité)" : "lecture");
+    if (!compat) smooth(radioGainRef.current.gain, volume, 0.28);
+    smooth(noiseGainRef.current.gain, bruit, 0.38);
   }
 
   function smooth(param, target, secs) {
-    const ctx = ctxRef.current;
-    const now = ctx.currentTime;
-    try {
-      param.cancelScheduledValues(now);
-      param.setTargetAtTime(target, now, Math.max(0.01, secs));
-    } catch {}
+    const ctx = ctxRef.current; const now = ctx.currentTime;
+    try { param.cancelScheduledValues(now); param.setTargetAtTime(target, now, Math.max(0.01, secs)); } catch {}
   }
 
-  /* ————— Balayage auto ————— */
-  function startSweepTimer() {
-    stopSweepTimer();
-    const interval = msFromSpeed(vitesse);
-    sweepTimerRef.current = setInterval(() => {
-      setStationIndex(prev => {
-        const next = (prev + 1) % STATIONS.length;
-        if (marche) tuneTo(next);
-        return next;
-      });
-    }, interval);
+  /* ————— Balayage auto avec JITTER ————— */
+  function startSweep() {
+    stopSweep();
+    const scheduleNext = () => {
+      const base = msFromSpeed(vitesse);
+      const jitter = alea; // 0..0.6
+      const varMs = base * (Math.random() * 2 * jitter - jitter);
+      const delay = Math.max(120, Math.round(base + varMs));
+      sweepTimerRef.current = setTimeout(async () => {
+        setStationIndex(prev => {
+          const next = (prev + 1) % stations.length;
+          if (marche) tuneTo(next);
+          return next;
+        });
+        scheduleNext();
+      }, delay);
+    };
+    scheduleNext();
   }
-  function stopSweepTimer() {
-    if (sweepTimerRef.current) clearInterval(sweepTimerRef.current);
-    sweepTimerRef.current = null;
-  }
+  function stopSweep() { if (sweepTimerRef.current) clearTimeout(sweepTimerRef.current); sweepTimerRef.current = null; }
 
   /* ————— Enregistrement ————— */
   function toggleEnr() {
@@ -272,56 +351,63 @@ export default function Page() {
         setTimeout(()=>{ document.body.removeChild(a); URL.revokeObjectURL(url); },0);
       };
       rec.start(); recRef.current = rec; setEnr(true);
-    } else {
-      recRef.current?.stop(); setEnr(false);
-    }
+    } else { recRef.current?.stop(); setEnr(false); }
   }
 
   /* ————— Réactions ————— */
-  useEffect(() => { 
-    if (radioGainRef.current) radioGainRef.current.gain.value = volume; 
+  useEffect(() => { if (!ctxRef.current) return;
+    // volumes
+    if (radioGainRef.current) radioGainRef.current.gain.value = volume;
     if (audioElRef.current && compat) audioElRef.current.volume = clamp01(volume);
-  }, [volume, compat]);
-  useEffect(() => { if (noiseGainRef.current) noiseGainRef.current.gain.value = bruit; }, [bruit]);
-  useEffect(() => { if (bandpassRef.current) bandpassRef.current.Q.value = q; }, [q]);
-  useEffect(() => { if (bandpassRef.current) bandpassRef.current.frequency.value = Math.max(60, fMin); }, [fMin]);
-  useEffect(() => { if (ctxRef.current) rechain(filtre, compat); }, [filtre, compat]);
+    if (noiseGainRef.current)  noiseGainRef.current.gain.value  = bruit;
+
+    // filtre
+    if (bandpassRef.current) { bandpassRef.current.Q.value = q; bandpassRef.current.frequency.value = Math.max(60, fMin); }
+    rebuildChain({ compatMode: compat });
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [volume, bruit, q, fMin, filtre, compat]);
 
   useEffect(() => {
-    if (!autoSweep) { stopSweepTimer(); return; }
-    startSweepTimer();
-    return stopSweepTimer;
-  }, [autoSweep, vitesse, marche]);
+    if (!autoSweep) { stopSweep(); return; }
+    startSweep(); return stopSweep;
+  }, [autoSweep, vitesse, alea, marche, bank]); // relancer si banque change
+
+  // FX updates
+  useEffect(() => {
+    if (!ctxRef.current) return;
+    echoWetRef.current.gain.value = echoOn ? 0.8 : 0.0;
+    echoDelayRef.current.delayTime.value = msEcho(echoTime);
+    echoFbRef.current.gain.value = fbEcho(echoFb);
+  }, [echoOn, echoTime, echoFb]);
+
+  useEffect(() => {
+    if (!ctxRef.current) return;
+    reverbWetRef.current.gain.value = revOn ? revMix : 0.0;
+    reverbConvolverRef.current.buffer = makeImpulseResponse(ctxRef.current, secRev(revSize), 2.5);
+  }, [revOn, revSize, revMix]);
 
   /* ————— VU ————— */
   function startVuLoop() {
-    const analyser = analyserRef.current;
-    if (!analyser) return;
+    const analyser = analyserRef.current; if (!analyser) return;
     const data = new Uint8Array(analyser.fftSize);
     function loop() {
       analyser.getByteTimeDomainData(data);
-      let sum = 0;
-      for (let i = 0; i < data.length; i++) {
-        const v = (data[i] - 128) / 128;
-        sum += v * v;
-      }
-      const rms = Math.sqrt(sum / data.length);
-      const lvl = Math.min(1, rms * 1.8);
-      setVuG(l => l * 0.7 + lvl * 0.3);
-      setVuD(r => r * 0.7 + (lvl * 0.9) * 0.3);
+      let sum = 0; for (let i = 0; i < data.length; i++) { const v = (data[i] - 128) / 128; sum += v * v; }
+      const rms = Math.sqrt(sum / data.length); const lvl = Math.min(1, rms * 1.8);
+      setVuG(l => l * 0.7 + lvl * 0.3); setVuD(r => r * 0.7 + (lvl * 0.9) * 0.3);
       requestAnimationFrame(loop);
     }
     requestAnimationFrame(loop);
   }
 
   /* ————— UI ————— */
-  const tuneValue = STATIONS.length > 1 ? stationIndex / (STATIONS.length - 1) : 0;
+  const tuneValue = stations.length > 1 ? stationIndex / (stations.length - 1) : 0;
 
   return (
     <main style={styles.page}>
       <div style={styles.shadowWrap}>
         <div style={styles.cabinet}>
-          {/* En-tête */}
+          {/* Tête */}
           <div style={styles.headerBar}>
             <div style={styles.brandPlate}>
               <div style={styles.brandText}>MADAME FANTÔMES</div>
@@ -337,17 +423,19 @@ export default function Page() {
           <div style={styles.glass}>
             <div style={styles.scaleWrap}>
               <div style={styles.scaleGrid} />
-              {STATIONS.map((s, i) => (
-                <div key={s.name} style={{ ...styles.tick, left: `${(i/(STATIONS.length-1))*100}%` }} />
+              {stations.map((s, i) => (
+                <div key={s.name} style={{ ...styles.tick, left: `${(i/(stations.length-1))*100}%` }} />
               ))}
               <div style={{ ...styles.needle, left: `${tuneValue*100}%` }} />
             </div>
             <div style={styles.stationRow}>
-              <div><strong>{STATIONS[stationIndex].name}</strong></div>
+              <div><strong>Banque {bank} · {stations[stationIndex].name}</strong></div>
               <div><em style={{ opacity: 0.9 }}>{etat}</em></div>
             </div>
             {compat && (
-              <div style={styles.compatBanner}>Mode compatibilité CORS : filtre inactif sur la radio</div>
+              <div style={styles.compatBanner}>
+                Mode compatibilité CORS : FX/filtre limités à la voie BRUIT
+              </div>
             )}
           </div>
 
@@ -362,25 +450,37 @@ export default function Page() {
 
           {/* Contrôles */}
           <div style={styles.controlsRow}>
+            {/* Col. gauche */}
             <div style={styles.colLeft}>
               <Switch label="MARCHE" on={marche} onChange={async v => { setMarche(v); v ? await marcheOn() : marcheOff(); }} />
               <Switch label="FILTRE" on={filtre} onChange={setFiltre} />
               <Switch label="BALAYAGE AUTO" on={autoSweep} onChange={setAutoSweep} />
               <Knob label="VITESSE" value={vitesse} onChange={v => setVitesse(clamp01(v))} hint={`${msFromSpeed(vitesse)} ms`} />
+              <Knob label="ALÉA" value={alea} onChange={v => setAlea(clamp01(v))} hint={`±${Math.round(alea*100)}%`} />
             </div>
 
+            {/* Col. centre */}
             <div style={styles.colCenter}>
               <Knob label="VOLUME" value={volume} onChange={v => setVolume(clamp01(v))} />
-              <Knob label="BRUIT"   value={bruit} onChange={v => setBruit(clamp01(v))} />
+              <Knob label="BRUIT"   value={bruit}  onChange={v => setBruit(clamp01(v))} />
               <Bouton label={enr ? "STOP" : "ENREGISTRER"} color={enr ? "#f0c14b" : "#d94242"} onClick={toggleEnr} />
+              <div style={{display:"grid", gridTemplateColumns:"1fr 1fr", gap:10, marginTop:8}}>
+                <Switch label="ÉCHO" on={echoOn} onChange={setEchoOn} />
+                <Switch label="RÉVERB" on={revOn} onChange={setRevOn} />
+                <MiniDial label="Temps écho" min={0} max={1} step={0.01} value={echoTime} setValue={setEchoTime} />
+                <MiniDial label="Retour écho" min={0} max={1} step={0.01} value={echoFb} setValue={setEchoFb} />
+                <MiniDial label="Taille réverb" min={0} max={1} step={0.01} value={revSize} setValue={setRevSize} />
+                <MiniDial label="Mix réverb" min={0} max={1} step={0.01} value={revMix} setValue={setRevMix} />
+              </div>
             </div>
 
+            {/* Col. droite */}
             <div style={styles.colRight}>
               <BigKnob
                 label="RÉGLAGE"
                 value={tuneValue}
                 onChange={async v => {
-                  const idx = Math.round(clamp01(v) * (STATIONS.length - 1));
+                  const idx = Math.round(clamp01(v) * (stations.length - 1));
                   setStationIndex(idx);
                   if (marche) await tuneTo(idx);
                 }}
@@ -389,9 +489,13 @@ export default function Page() {
                 <MiniDial label="Q" min={0.4} max={6} step={0.1} value={q} setValue={setQ} />
                 <MiniDial label="fMin" min={60} max={2000} step={20} value={fMin} setValue={setFMin} />
                 <Bouton label="SUIVANTE" onClick={async () => {
-                  const next = (stationIndex + 1) % STATIONS.length;
+                  const next = (stationIndex + 1) % stations.length;
                   setStationIndex(next); if (marche) await tuneTo(next);
                 }} />
+                <div style={{display:"grid", gridTemplateColumns:"1fr 1fr", gap:6}}>
+                  <Bouton label="Banque A" onClick={() => { setBank("A"); setStationIndex(0); }} />
+                  <Bouton label="Banque B" onClick={() => { setBank("B"); setStationIndex(0); }} />
+                </div>
               </div>
             </div>
           </div>
@@ -403,13 +507,14 @@ export default function Page() {
       </div>
 
       <p style={{ color: "rgba(255,255,255,0.7)", marginTop: 14, fontSize: 12 }}>
-        Tip : active <strong>MARCHE</strong>, puis joue avec <strong>RÉGLAGE</strong>, <strong>FILTRE</strong> et <strong>BRUIT</strong>.
+        Tip : active <strong>MARCHE</strong>, essaie la <strong>Banque B</strong>, teste l’<strong>ALÉA</strong> du balayage
+        et joue avec <strong>ÉCHO</strong>/<strong>RÉVERB</strong>. En mode compat CORS, les FX s’appliquent surtout au <strong>BRUIT</strong>.
       </p>
     </main>
   );
 }
 
-/* ————— UI widgets ————— */
+/* ————— Widgets UI ————— */
 
 function Knob({ label, value, onChange, hint }) {
   const [drag, setDrag] = useState(null);
@@ -439,12 +544,7 @@ function BigKnob({ label, value, onChange }) {
       <div
         style={{ ...ui.bigKnob, transform: `rotate(${angle}deg)` }}
         onPointerDown={(e) => { e.currentTarget.setPointerCapture(e.pointerId); setDrag({ x: e.clientX, y: e.clientY, v: value }); }}
-        onPointerMove={(e) => {
-          if (!drag) return;
-          const dy = (drag.y - e.clientY) / 340;
-          const dx = (e.clientX - drag.x) / 420;
-          onChange(drag.v + dy + dx * 0.25);
-        }}
+        onPointerMove={(e) => { if (!drag) return; const dy = (drag.y - e.clientY) / 340; const dx = (e.clientX - drag.x) / 420; onChange(drag.v + dy + dx * 0.25); }}
         onPointerUp={() => setDrag(null)} onPointerCancel={() => setDrag(null)}
       >
         <div style={ui.bigKnobIndicator} />
@@ -483,7 +583,7 @@ function MiniDial({ label, min, max, step, value, setValue }) {
     <div style={ui.miniDial}>
       <div style={ui.miniLabel}>{label}</div>
       <input type="range" min={min} max={max} step={step} value={value} onChange={(e) => setValue(Number(e.target.value))} style={{ width: "100%" }} />
-      <div style={ui.miniVal}>{Math.round(value)}</div>
+      <div style={ui.miniVal}>{(label.includes("%") ? Math.round(value*100) : Math.round(value*100)/100) || Math.round(value)}</div>
     </div>
   );
 }
@@ -517,10 +617,8 @@ const styles = {
     width: "min(980px, 94vw)", borderRadius: 26, padding: 16,
     border: "1px solid rgba(30,20,10,0.6)",
     boxShadow: "0 28px 80px rgba(0,0,0,0.65), inset 0 0 0 1px rgba(255,255,255,0.03)",
-    // 👉 on superpose le SVG (image) et des couches sombres pour l’ambiance
     backgroundImage: "url('/radio-vintage.svg'), linear-gradient(180deg, rgba(0,0,0,0.12), rgba(0,0,0,0.18))",
-    backgroundSize: "cover",
-    backgroundPosition: "center",
+    backgroundSize: "cover", backgroundPosition: "center",
     position: "relative", overflow: "hidden"
   },
   headerBar: { display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 12 },
@@ -562,8 +660,8 @@ const styles = {
   },
 
   controlsRow: { marginTop: 14, display: "grid", gridTemplateColumns: "1.05fr 1fr 1.05fr", gap: 14 },
-  colLeft: { display: "grid", gridTemplateRows: "auto auto auto auto", gap: 10, alignContent: "start" },
-  colCenter: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14, alignItems: "center", justifyItems: "center" },
+  colLeft: { display: "grid", gridTemplateRows: "auto auto auto auto auto", gap: 10, alignContent: "start" },
+  colCenter: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14, alignItems: "start", justifyItems: "center" },
   colRight: { display: "grid", gridTemplateRows: "auto auto", gap: 10, justifyItems: "center", alignContent: "start" },
   subDials: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, alignItems: "center" }
 };
