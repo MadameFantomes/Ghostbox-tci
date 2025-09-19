@@ -2,16 +2,20 @@
 
 /**
  * Ghostbox TCI — FR
- * - Bruit de balayage AUDIBLE : burst de bruit façonné (band-pass) + "clic" de commutation
- * - Souffle de fond léger (toujours présent quand MARCHE est ON)
+ * - AUCUN compteur de stations affiché (badge supprimé)
+ * - Bruit de balayage modulé & plus doux (HP→BP→LP + jitter + wobble)
+ * - Souffle de fond discret (quand MARCHE = ON)
  * - ENREGISTRER (.webm)
  * - Balayage AUTO + skip des flux HS (timeout)
+ * - Filtre radio “TCI” auto (HP/LP/Shelf + petite saturation) si CORS permet WebAudio
  * - Charge /public/stations.json sinon fallback
  */
 
 import React, { useEffect, useRef, useState } from "react";
 
-/* ------- Fallback si /stations.json absent ------- */
+const AUTO_FILTER = true; // filtre radio “TCI” appliqué quand possible (WebAudio)
+
+// ------- Fallback si /stations.json absent -------
 const FALLBACK_STATIONS = [
   "https://icecast.radiofrance.fr/fip-midfi.mp3",
   "https://icecast.radiofrance.fr/fiprock-midfi.mp3",
@@ -33,16 +37,26 @@ export default function Page() {
   const mediaSrcRef = useRef(null);
   const radioGainRef = useRef(null);
 
+  // BRUIT (balayage)
   const noiseNodeRef = useRef(null);
-  const noiseFilterRef = useRef(null);   // <— band-pass pour façonner le bruit
+  const noiseHPRef = useRef(null);
+  const noiseFilterRef = useRef(null);
+  const noiseLPRef = useRef(null);
   const noiseGainRef = useRef(null);
 
+  // Radio FX (auto-filtre “TCI”)
+  const radioHPRef = useRef(null);
+  const radioLPRef = useRef(null);
+  const radioShelfRef = useRef(null);
+  const driveRef = useRef(null);
+
+  // Mix & Écho
   const dryRef = useRef(null);
   const echoDelayRef = useRef(null);
   const echoFbRef = useRef(null);
   const echoWetRef = useRef(null);
 
-  // "clic" de commutation
+  // “clic” de commutation
   const clickBusRef = useRef(null);
 
   // Stations / index
@@ -56,30 +70,29 @@ export default function Page() {
   const [marche, setMarche] = useState(false);
   const [auto, setAuto] = useState(false);
   const [compat, setCompat] = useState(false);
-  const [sourceInfo, setSourceInfo] = useState("");
   const sweepTimerRef = useRef(null);
   const playingLockRef = useRef(false);
 
-  // 4 réglages
+  // Contrôles
   const [vitesse, setVitesse] = useState(0.45); // 250..2500 ms
-  const [volume, setVolume]   = useState(0.9);
-  const [echo, setEcho]       = useState(0.3);  // mix + fb
-  const [debit, setDebit]     = useState(0.8);  // intensité/durée du bruit (par défaut haut)
+  const [volume, setVolume] = useState(0.9);
+  const [echo, setEcho] = useState(0.3); // mix + fb
+  const [debit, setDebit] = useState(0.5); // douceur par défaut
 
   // Enregistrement
   const [enr, setEnr] = useState(false);
   const recRef = useRef(null);
   const chunksRef = useRef([]);
 
-  // Helpers bruit
+  // Helpers
   const clamp01 = (x) => Math.max(0, Math.min(1, x));
-  const msFromSpeed = (v) => Math.round(250 + v * (2500 - 250));   // 250..2500
-  const BASE_NOISE = 0.08;                                         // souffle de fond audible
-  const burstMs = () => Math.round(150 + debit * 600);             // 150..750 ms
-  const burstGain = () => Math.min(1.2, 0.35 + debit * 1.0);       // 0.35..1.2
+  const msFromSpeed = (v) => Math.round(250 + v * (2500 - 250)); // 250..2500
+  const BASE_NOISE = 0.025; // souffle de fond discret
+  const burstMs = () => Math.round(120 + debit * 520); // 120..640 ms
+  const burstGain = () => 0.18 + debit * 0.65; // moins agressif
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-  /* ------- Charger /stations.json ------- */
+  // ------- Charger /stations.json -------
   useEffect(() => {
     (async () => {
       try {
@@ -91,20 +104,17 @@ export default function Page() {
           setStations(flat);
           stationsRef.current = flat;
           idxRef.current = 0; setIdx(0);
-          setSourceInfo(`${flat.length} stations (stations.json)`);
           return;
         }
-        setSourceInfo(`${FALLBACK_STATIONS.length} stations (fallback)`);
       } catch {
         stationsRef.current = FALLBACK_STATIONS;
-        setSourceInfo(`${FALLBACK_STATIONS.length} stations (fallback)`);
       }
     })();
   }, []);
 
   function normalizeStationsJson(json) {
     let list = [];
-    const push = (name, url, suffix="") => {
+    const push = (name, url, suffix = "") => {
       if (!url || typeof url !== "string") return;
       if (!/^https:/i.test(url)) return;
       try {
@@ -117,7 +127,7 @@ export default function Page() {
       json.forEach((s) => {
         if (!s) return;
         if (s.url) push(s.name, s.url);
-        if (Array.isArray(s.urls)) s.urls.forEach((u, k) => push(s.name, u, ` #${k+1}`));
+        if (Array.isArray(s.urls)) s.urls.forEach((u, k) => push(s.name, u, ` #${k + 1}`));
       });
     } else if (json && typeof json === "object") {
       Object.entries(json).forEach(([group, arr]) => {
@@ -125,18 +135,21 @@ export default function Page() {
         arr.forEach((s) => {
           if (!s) return;
           if (s.url) push(s.name || group, s.url);
-          if (Array.isArray(s.urls)) s.urls.forEach((u, k) => push(s.name || group, u, ` #${k+1}`));
+          if (Array.isArray(s.urls)) s.urls.forEach((u, k) => push(s.name || group, u, ` #${k + 1}`));
         });
       });
     }
     const seen = new Set();
     list = list.filter((s) => (seen.has(s.url) ? false : seen.add(s.url)));
-    // mélange
-    for (let i = list.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [list[i], list[j]] = [list[j], list[i]]; }
+    // mélange léger
+    for (let i = list.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [list[i], list[j]] = [list[j], list[i]];
+    }
     return list;
   }
 
-  /* ------- Init WebAudio ------- */
+  // ------- Init WebAudio -------
   async function initAudio() {
     if (ctxRef.current) return;
     const ctx = new (window.AudioContext || window.webkitAudioContext)();
@@ -153,11 +166,20 @@ export default function Page() {
     // Radio
     const gRadio = ctx.createGain(); gRadio.gain.value = 1; radioGainRef.current = gRadio;
 
-    // Bruit blanc + façonnage (band-pass) + gain
+    // Bruit (HP→BP→LP→Gain)
     const noise = createNoiseNode(ctx); noiseNodeRef.current = noise;
-    const bp = ctx.createBiquadFilter(); bp.type = "bandpass"; bp.Q.value = 0.9; bp.frequency.value = 2200;
-    noiseFilterRef.current = bp;
+    const hpN = ctx.createBiquadFilter(); hpN.type = "highpass"; hpN.frequency.value = 160; hpN.Q.value = 0.7;
+    const bp = ctx.createBiquadFilter(); bp.type = "bandpass"; bp.Q.value = 0.55; bp.frequency.value = 1800;
+    const lpN = ctx.createBiquadFilter(); lpN.type = "lowpass"; lpN.frequency.value = 6500; lpN.Q.value = 0.3;
+    noiseHPRef.current = hpN; noiseFilterRef.current = bp; noiseLPRef.current = lpN;
     const gNoise = ctx.createGain(); gNoise.gain.value = 0; noiseGainRef.current = gNoise;
+
+    // Radio auto-filtre (HP / LP / shelf + drive)
+    const hp = ctx.createBiquadFilter();  hp.type = "highpass"; hp.frequency.value = 320; hp.Q.value = 0.7;
+    const lp = ctx.createBiquadFilter();  lp.type = "lowpass";  lp.frequency.value = 3400; lp.Q.value = 0.7;
+    const shelf = ctx.createBiquadFilter(); shelf.type = "highshelf"; shelf.frequency.value = 2500; shelf.gain.value = -4;
+    const drive = createDriveNode(ctx, 0.22);
+    radioHPRef.current = hp; radioLPRef.current = lp; radioShelfRef.current = shelf; driveRef.current = drive;
 
     // Dry & ÉCHO
     const dry = ctx.createGain(); dry.gain.value = 1; dryRef.current = dry;
@@ -167,15 +189,15 @@ export default function Page() {
     const wet = ctx.createGain(); wet.gain.value = 0;
     echoDelayRef.current = dly; echoFbRef.current = fb; echoWetRef.current = wet;
 
-    // "clic" bus
+    // “clic” bus
     const clickBus = ctx.createGain(); clickBus.gain.value = 0; clickBus.connect(master);
     clickBusRef.current = clickBus;
 
     // Somme → master
     const sum = ctx.createGain(); sum.gain.value = 1;
-    gRadio.connect(sum);
-    // chaîne bruit: noise → bandpass → gNoise → sum
-    noise.connect(bp); bp.connect(gNoise); gNoise.connect(sum);
+    // radio branchée plus tard (attachMedia), soit via filtre, soit direct → gRadio → sum
+    // bruit : noise → HP → BP → LP → gNoise → sum
+    noise.connect(hpN); hpN.connect(bp); bp.connect(lpN); lpN.connect(gNoise); gNoise.connect(sum);
 
     sum.connect(dry);  dry.connect(master);
     sum.connect(dly);  dly.connect(wet); wet.connect(master);
@@ -192,46 +214,34 @@ export default function Page() {
     return src;
   }
 
-  // petit "clic" court (2–5 ms) pour le changement de station
-  function triggerClick(level = 0.5) {
-    const ctx = ctxRef.current; if (!ctx || !clickBusRef.current) return;
-    const dur = 0.015;
-    const buf = ctx.createBuffer(1, Math.max(1, Math.floor(dur * ctx.sampleRate)), ctx.sampleRate);
-    const d = buf.getChannelData(0);
-    for (let i = 0; i < d.length; i++) d[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / d.length, 12);
-    const src = ctx.createBufferSource(); src.buffer = buf;
-
-    const g = clickBusRef.current;
-    const now = ctx.currentTime;
-    try {
-      g.gain.cancelScheduledValues(now);
-      g.gain.setValueAtTime(level, now);
-      g.gain.exponentialRampToValueAtTime(0.0001, now + dur);
-    } catch {}
-    src.connect(g);
-    src.start();
+  // légère saturation
+  function createDriveNode(ctx, amount = 0.25) {
+    const ws = ctx.createWaveShaper();
+    ws.curve = makeDistortionCurve(amount);
+    ws.oversample = "4x";
+    return ws;
   }
-
-  // éclaboussure de bruit façonné (band-pass qui glisse)
-  function playScanBurst(targetGain, durSec) {
-    const ctx = ctxRef.current; if (!ctx) return;
+  function makeDistortionCurve(amount = 0.25) {
+    const k = amount * 100, n = 44100, curve = new Float32Array(n);
+    for (let i = 0; i < n; i++) {
+      const x = (i * 2) / n - 1;
+      curve[i] = ((1 + k) * x) / (1 + k * Math.abs(x));
+    }
+    return curve;
+  }
+  function applyAutoFilterProfile() {
+    // petit profil aléatoire par station
+    const ctx = ctxRef.current; if (!AUTO_FILTER || !ctx || !radioHPRef.current) return;
     const now = ctx.currentTime;
-    const bp = noiseFilterRef.current;
-    const g = noiseGainRef.current?.gain;
-
-    // fréquence qui "glisse" (effet recherche)
-    const f1 = 1200 + Math.random()*1800; // 1.2–3kHz
-    const f2 = 2000 + Math.random()*3000; // 2–5kHz
+    const hpF = 260 + Math.random() * 160;      // 260..420 Hz
+    const lpF = 2800 + Math.random() * 1600;    // 2.8..4.4 kHz
+    const shelfGain = -(2 + Math.random() * 5); // -2..-7 dB
+    const driveAmt = 0.18 + Math.random() * 0.14;
     try {
-      bp.frequency.cancelScheduledValues(now);
-      bp.frequency.setValueAtTime(f1, now);
-      bp.frequency.linearRampToValueAtTime(f2, now + durSec);
-    } catch {}
-
-    // montée du bruit
-    try {
-      g.cancelScheduledValues(now);
-      g.setTargetAtTime(targetGain, now, 0.04);
+      radioHPRef.current.frequency.setTargetAtTime(hpF, now, 0.08);
+      radioLPRef.current.frequency.setTargetAtTime(lpF, now, 0.08);
+      radioShelfRef.current.gain.setTargetAtTime(shelfGain, now, 0.1);
+      driveRef.current.curve = makeDistortionCurve(driveAmt);
     } catch {}
   }
 
@@ -240,19 +250,30 @@ export default function Page() {
     if (mediaSrcRef.current) return;
     try {
       const src = ctxRef.current.createMediaElementSource(audioElRef.current);
-      mediaSrcRef.current = src; src.connect(radioGainRef.current);
+      mediaSrcRef.current = src;
+
+      if (AUTO_FILTER && radioHPRef.current) {
+        // src → HP → LP → Shelf → Drive → gRadio
+        src.connect(radioHPRef.current);
+        radioHPRef.current.connect(radioLPRef.current);
+        radioLPRef.current.connect(radioShelfRef.current);
+        radioShelfRef.current.connect(driveRef.current);
+        driveRef.current.connect(radioGainRef.current);
+      } else {
+        src.connect(radioGainRef.current);
+      }
+
       setCompat(false);
     } catch {
-      setCompat(true); // CORS bloque WebAudio — le bruit reste audible (il est local)
+      setCompat(true); // CORS : pas de traitement possible
     }
   }
 
-  /* ------- Power ------- */
+  // ------- Power -------
   async function powerOn() {
     await initAudio();
     const ctx = ctxRef.current;
     if (ctx.state === "suspended") await ctx.resume();
-    // souffle de fond
     try { noiseGainRef.current.gain.value = BASE_NOISE; } catch {}
     await playIndex(idxRef.current);
     setMarche(true);
@@ -271,7 +292,77 @@ export default function Page() {
     playingLockRef.current = false;
   }
 
-  /* ------- Lecture robuste (burst bruit + clic + timeout + skip) ------- */
+  // petit “clic” de commutation
+  function triggerClick(level = 0.35) {
+    const ctx = ctxRef.current; if (!ctx || !clickBusRef.current) return;
+    const dur = 0.015;
+    const buf = ctx.createBuffer(1, Math.max(1, Math.floor(dur * ctx.sampleRate)), ctx.sampleRate);
+    const d = buf.getChannelData(0);
+    for (let i = 0; i < d.length; i++) d[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / d.length, 12);
+    const src = ctx.createBufferSource(); src.buffer = buf;
+    const g = clickBusRef.current;
+    const now = ctx.currentTime;
+    try {
+      g.gain.cancelScheduledValues(now);
+      g.gain.setValueAtTime(level, now);
+      g.gain.exponentialRampToValueAtTime(0.0001, now + dur);
+    } catch {}
+    src.connect(g);
+    src.start();
+  }
+
+  // éclaboussure de bruit modulée (balayage)
+  function playScanBurst(targetGain, durSec) {
+    const ctx = ctxRef.current; if (!ctx) return;
+    const now = ctx.currentTime;
+
+    const bp = noiseFilterRef.current;
+    const hp = noiseHPRef.current;
+    const lp = noiseLPRef.current;
+    const g = noiseGainRef.current?.gain;
+
+    // couleur selon DÉBIT
+    const q = 0.35 + debit * 0.5;          // 0.35..0.85
+    const lpF = 4800 + debit * 2200;       // 4.8..7.0 kHz
+    const hpF = 180 + debit * 220;         // 180..400 Hz
+    try {
+      bp.Q.setTargetAtTime(q, now, 0.05);
+      lp.frequency.setTargetAtTime(lpF, now, 0.08);
+      hp.frequency.setTargetAtTime(hpF, now, 0.08);
+    } catch {}
+
+    // glissando organique + jitter
+    const fStart = 900 + Math.random() * 900;   // 0.9–1.8 kHz
+    const fMid   = 1400 + Math.random() * 1900; // 1.4–3.3 kHz
+    const fEnd   = 2200 + Math.random() * 2200; // 2.2–4.4 kHz
+    const steps  = Math.max(4, Math.floor(durSec * 10));
+    for (let i = 0; i <= steps; i++) {
+      const t = now + (durSec * i) / steps;
+      const x = i / steps;
+      const f = (x < 0.6)
+        ? fStart + (fMid - fStart) * (x / 0.6)
+        : fMid   + (fEnd - fMid)   * ((x - 0.6) / 0.4);
+      const jitter = (Math.random() * 2 - 1) * (120 + 600 * (1 - debit));
+      try { bp.frequency.linearRampToValueAtTime(Math.max(300, f + jitter), t); } catch {}
+    }
+
+    // enveloppe d’amplitude avec petites vagues (wobble)
+    try {
+      g.cancelScheduledValues(now);
+      const attack = Math.min(0.06, durSec * 0.25);
+      g.setValueAtTime(BASE_NOISE, now);
+      g.linearRampToValueAtTime(targetGain * (0.6 + 0.2 * Math.random()), now + attack);
+
+      const wobbleN = Math.max(2, Math.floor(durSec / 0.08));
+      for (let i = 1; i <= wobbleN; i++) {
+        const t = now + attack + (durSec - attack) * (i / wobbleN);
+        const lvl = targetGain * (0.55 + 0.35 * Math.random());
+        g.linearRampToValueAtTime(lvl, t);
+      }
+    } catch {}
+  }
+
+  // ------- Lecture robuste (burst + clic + timeout + skip) -------
   async function playIndex(startIndex, tries = 0) {
     const list = stationsRef.current;
     if (!list.length) return;
@@ -288,8 +379,8 @@ export default function Page() {
     const dur = burstMs() / 1000;
     const targetNoise = burstGain();
 
-    // 1) clic + montée du bruit façonné, on baisse la radio
-    triggerClick(0.6);
+    // 1) clic + montée du bruit modulé, on baisse la radio
+    triggerClick(0.35);
     try {
       if (!compat) {
         radioGainRef.current.gain.cancelScheduledValues(now);
@@ -301,7 +392,6 @@ export default function Page() {
     playScanBurst(targetNoise, dur);
     setEtat("balayage…");
 
-    // attendre un peu (une bonne partie du burst)
     await sleep(Math.max(100, dur * 600));
 
     // 2) charger / jouer
@@ -313,10 +403,10 @@ export default function Page() {
       const timeout = new Promise((_, rej) => setTimeout(() => rej(new Error("timeout")), 3500));
       await Promise.race([playP, timeout]);
 
-      // brancher WebAudio si possible
       await attachMedia();
+      applyAutoFilterProfile();
 
-      // 3) fondu retour : bruit → fond, radio → 1
+      // 3) retour : bruit → fond, radio → 1
       const after = ctx.currentTime + Math.max(0.08, dur * 0.6);
       try {
         noiseGainRef.current.gain.setTargetAtTime(BASE_NOISE, after, 0.12);
@@ -326,8 +416,7 @@ export default function Page() {
 
       idxRef.current = startIndex; setIdx(startIndex);
       setEtat(compat ? "lecture (compatibilité)" : "lecture");
-    } catch (e) {
-      // Échec → couper le burst, garder le souffle de fond, passer à la suivante
+    } catch {
       try { noiseGainRef.current.gain.setTargetAtTime(BASE_NOISE, ctx.currentTime + 0.05, 0.12); } catch {}
       const next = (startIndex + 1) % list.length;
       playingLockRef.current = false;
@@ -338,7 +427,7 @@ export default function Page() {
     playingLockRef.current = false;
   }
 
-  /* ------- Balayage auto ------- */
+  // ------- Balayage auto -------
   function startSweep() {
     stopSweep();
     const tick = async () => {
@@ -355,7 +444,7 @@ export default function Page() {
     sweepTimerRef.current = null;
   }
 
-  /* ------- Enregistrement ------- */
+  // ------- Enregistrement -------
   function toggleEnr() {
     if (!destRef.current) return;
     if (!enr) {
@@ -366,9 +455,9 @@ export default function Page() {
         const blob = new Blob(chunksRef.current, { type: "audio/webm" });
         const url = URL.createObjectURL(blob);
         const a = document.createElement("a");
-        a.href = url; a.download = `ghostbox-${new Date().toISOString().replace(/[:.]/g,"-")}.webm`;
+        a.href = url; a.download = `ghostbox-${new Date().toISOString().replace(/[:.]/g, "-")}.webm`;
         document.body.appendChild(a); a.click();
-        setTimeout(()=>{ document.body.removeChild(a); URL.revokeObjectURL(url); },0);
+        setTimeout(() => { document.body.removeChild(a); URL.revokeObjectURL(url); }, 0);
       };
       rec.start();
       recRef.current = rec; setEnr(true);
@@ -378,7 +467,7 @@ export default function Page() {
     }
   }
 
-  /* ------- Réactions contrôles ------- */
+  // ------- Réactions contrôles -------
   useEffect(() => {
     if (masterRef.current) masterRef.current.gain.value = clamp01(volume);
     if (audioElRef.current && compat) audioElRef.current.volume = clamp01(volume);
@@ -396,7 +485,7 @@ export default function Page() {
     return stopSweep;
   }, [auto, vitesse, marche]);
 
-  /* ------- UI ------- */
+  // ------- UI -------
   const list = stationsRef.current;
   const current = list[idxRef.current];
   const currentName = current?.name || (current?.url ? new URL(current.url).host : "");
@@ -407,14 +496,13 @@ export default function Page() {
         <div style={styles.cabinet}>
           <div style={styles.textureOverlay} />
 
-          {/* Titre + badges */}
+          {/* En-tête (SANS compteur) */}
           <div style={styles.headerBar}>
             <div style={styles.brandPlate}>
               <div style={styles.brandText}>MADAME FANTÔMES</div>
               <div style={styles.brandSub}>Ghostbox • Formation TCI</div>
             </div>
             <div style={styles.rightHeader}>
-              <div style={styles.badge}>{sourceInfo || `${list.length} stations`}</div>
               <div style={styles.lampsRow}>
                 <Lamp label="MARCHE" on={marche} />
                 <Lamp label="AUTO" on={auto} colorOn="#86fb6a" />
@@ -457,13 +545,13 @@ export default function Page() {
       </div>
 
       <p style={{ color: "rgba(255,255,255,0.8)", marginTop: 10, fontSize: 12 }}>
-        Pour bien entendre le <em>balayage</em> : mets <strong>DÉBIT</strong> vers 0.7–1.0. Un petit “clic” est ajouté à chaque saut.
+        Pour un balayage doux et “vieille radio”, règle <strong>DÉBIT</strong> vers 0.3–0.5. Plus haut = plus présent.
       </p>
     </main>
   );
 }
 
-/* ------- UI widgets (inchangés) ------- */
+/* ------- UI widgets ------- */
 
 function Knob({ label, value, onChange, hint }) {
   const [drag, setDrag] = useState(null);
@@ -513,7 +601,7 @@ function Vis({ at }) {
   return <div style={{ ...decor.screw, ...pos }} />;
 }
 
-/* ------- Styles (version aquarelle) ------- */
+/* ------- Styles (aquarelle) ------- */
 
 const styles = {
   page: {
@@ -556,10 +644,6 @@ const styles = {
   brandSub: { fontFamily: "Georgia,serif", fontSize: 12, opacity: 0.8 },
 
   rightHeader: { display: "flex", alignItems: "center", gap: 12 },
-  badge: {
-    fontSize: 12, color: "#0b0b10", background: "#e7c17a",
-    border: "1px solid rgba(70,60,45,0.6)", padding: "4px 8px", borderRadius: 10, fontWeight: 800
-  },
   lampsRow: { display: "flex", gap: 14, alignItems: "center" },
 
   glass: {
