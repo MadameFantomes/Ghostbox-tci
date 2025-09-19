@@ -1,7 +1,4 @@
-export const metadata = {
-  title: "Ghostbox TCI (MVP radio)",
-  description: "Lecture radio live — étape 1"
-};
+export const metadata = { title: "Ghostbox TCI (MVP radio)", description: "Lecture radio live — étape 1" };
 
 export default function RootLayout({ children }) {
   return (
