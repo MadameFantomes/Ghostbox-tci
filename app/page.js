@@ -1,13 +1,12 @@
 "use client";
 
 /**
- * Ghostbox TCI — FR minimal
- * Fixes:
- *  - MARCHE = arrêt total (stop timer + pause <audio> + coupe bruit + suspend AudioContext)
- *  - ENREGISTRER (MediaRecorder .webm) — remplace "SUIVANTE"
- *  - Bruit de balayage + fond audible (DÉBIT contrôle durée/intensité)
- *  - Lecture robuste (auto-skip des flux HS avec timeout)
- *  - Charge /public/stations.json (HTTPS), sinon fallback 7 stations
+ * Ghostbox TCI — FR
+ * - Bruit de balayage AUDIBLE : burst de bruit façonné (band-pass) + "clic" de commutation
+ * - Souffle de fond léger (toujours présent quand MARCHE est ON)
+ * - ENREGISTRER (.webm)
+ * - Balayage AUTO + skip des flux HS (timeout)
+ * - Charge /public/stations.json sinon fallback
  */
 
 import React, { useEffect, useRef, useState } from "react";
@@ -35,6 +34,7 @@ export default function Page() {
   const radioGainRef = useRef(null);
 
   const noiseNodeRef = useRef(null);
+  const noiseFilterRef = useRef(null);   // <— band-pass pour façonner le bruit
   const noiseGainRef = useRef(null);
 
   const dryRef = useRef(null);
@@ -42,11 +42,12 @@ export default function Page() {
   const echoFbRef = useRef(null);
   const echoWetRef = useRef(null);
 
-  // Stations
+  // "clic" de commutation
+  const clickBusRef = useRef(null);
+
+  // Stations / index
   const [stations, setStations] = useState(FALLBACK_STATIONS);
   const stationsRef = useRef(FALLBACK_STATIONS);
-
-  // Index courant (state + ref pour timers)
   const [idx, setIdx] = useState(0);
   const idxRef = useRef(0);
 
@@ -61,24 +62,24 @@ export default function Page() {
 
   // 4 réglages
   const [vitesse, setVitesse] = useState(0.45); // 250..2500 ms
-  const [volume, setVolume]   = useState(0.9);  // master
+  const [volume, setVolume]   = useState(0.9);
   const [echo, setEcho]       = useState(0.3);  // mix + fb
-  const [debit, setDebit]     = useState(0.7);  // intensité & durée bruit (par défaut plus fort)
+  const [debit, setDebit]     = useState(0.8);  // intensité/durée du bruit (par défaut haut)
 
   // Enregistrement
   const [enr, setEnr] = useState(false);
   const recRef = useRef(null);
   const chunksRef = useRef([]);
 
-  // Helpers
+  // Helpers bruit
   const clamp01 = (x) => Math.max(0, Math.min(1, x));
-  const msFromSpeed = (v) => Math.round(250 + v * (2500 - 250));  // 250..2500
-  const BASE_NOISE = 0.035;                                       // léger bruit de fond
-  const burstMs = () => Math.round(120 + debit * 520);            // 120..640 ms de bruit
-  const burstGain = () => 0.25 + debit * 0.9;                     // 0.25..1.15 (sera clampé)
+  const msFromSpeed = (v) => Math.round(250 + v * (2500 - 250));   // 250..2500
+  const BASE_NOISE = 0.08;                                         // souffle de fond audible
+  const burstMs = () => Math.round(150 + debit * 600);             // 150..750 ms
+  const burstGain = () => Math.min(1.2, 0.35 + debit * 1.0);       // 0.35..1.2
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-  /* ------- Charger /stations.json si présent ------- */
+  /* ------- Charger /stations.json ------- */
   useEffect(() => {
     (async () => {
       try {
@@ -105,7 +106,7 @@ export default function Page() {
     let list = [];
     const push = (name, url, suffix="") => {
       if (!url || typeof url !== "string") return;
-      if (!/^https:/i.test(url)) return; // HTTPS only
+      if (!/^https:/i.test(url)) return;
       try {
         url = url.trim();
         const nm = (name && name.trim()) || new URL(url).host + suffix;
@@ -128,9 +129,9 @@ export default function Page() {
         });
       });
     }
-    // dédup + mélange
     const seen = new Set();
     list = list.filter((s) => (seen.has(s.url) ? false : seen.add(s.url)));
+    // mélange
     for (let i = list.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [list[i], list[j]] = [list[j], list[i]]; }
     return list;
   }
@@ -141,34 +142,45 @@ export default function Page() {
     const ctx = new (window.AudioContext || window.webkitAudioContext)();
     ctxRef.current = ctx;
 
+    // Master
     const master = ctx.createGain(); master.gain.value = clamp01(volume); master.connect(ctx.destination);
     masterRef.current = master;
 
-    // enregistrement
+    // Enregistrement
     const dest = ctx.createMediaStreamDestination(); master.connect(dest);
     destRef.current = dest;
 
-    // radio
+    // Radio
     const gRadio = ctx.createGain(); gRadio.gain.value = 1; radioGainRef.current = gRadio;
 
-    // bruit
+    // Bruit blanc + façonnage (band-pass) + gain
+    const noise = createNoiseNode(ctx); noiseNodeRef.current = noise;
+    const bp = ctx.createBiquadFilter(); bp.type = "bandpass"; bp.Q.value = 0.9; bp.frequency.value = 2200;
+    noiseFilterRef.current = bp;
     const gNoise = ctx.createGain(); gNoise.gain.value = 0; noiseGainRef.current = gNoise;
-    const noise = createNoiseNode(ctx); noiseNodeRef.current = noise; try { noise.start(0); } catch {}
 
-    // dry & echo
+    // Dry & ÉCHO
     const dry = ctx.createGain(); dry.gain.value = 1; dryRef.current = dry;
-
     const dly = ctx.createDelay(1.2); dly.delayTime.value = 0.34;
     const fb  = ctx.createGain(); fb.gain.value = 0.25;
     dly.connect(fb); fb.connect(dly);
     const wet = ctx.createGain(); wet.gain.value = 0;
     echoDelayRef.current = dly; echoFbRef.current = fb; echoWetRef.current = wet;
 
-    // sommation
+    // "clic" bus
+    const clickBus = ctx.createGain(); clickBus.gain.value = 0; clickBus.connect(master);
+    clickBusRef.current = clickBus;
+
+    // Somme → master
     const sum = ctx.createGain(); sum.gain.value = 1;
-    gRadio.connect(sum); gNoise.connect(sum);
+    gRadio.connect(sum);
+    // chaîne bruit: noise → bandpass → gNoise → sum
+    noise.connect(bp); bp.connect(gNoise); gNoise.connect(sum);
+
     sum.connect(dry);  dry.connect(master);
     sum.connect(dly);  dly.connect(wet); wet.connect(master);
+
+    try { noise.start(0); } catch {}
   }
 
   function createNoiseNode(ctx) {
@@ -180,6 +192,49 @@ export default function Page() {
     return src;
   }
 
+  // petit "clic" court (2–5 ms) pour le changement de station
+  function triggerClick(level = 0.5) {
+    const ctx = ctxRef.current; if (!ctx || !clickBusRef.current) return;
+    const dur = 0.015;
+    const buf = ctx.createBuffer(1, Math.max(1, Math.floor(dur * ctx.sampleRate)), ctx.sampleRate);
+    const d = buf.getChannelData(0);
+    for (let i = 0; i < d.length; i++) d[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / d.length, 12);
+    const src = ctx.createBufferSource(); src.buffer = buf;
+
+    const g = clickBusRef.current;
+    const now = ctx.currentTime;
+    try {
+      g.gain.cancelScheduledValues(now);
+      g.gain.setValueAtTime(level, now);
+      g.gain.exponentialRampToValueAtTime(0.0001, now + dur);
+    } catch {}
+    src.connect(g);
+    src.start();
+  }
+
+  // éclaboussure de bruit façonné (band-pass qui glisse)
+  function playScanBurst(targetGain, durSec) {
+    const ctx = ctxRef.current; if (!ctx) return;
+    const now = ctx.currentTime;
+    const bp = noiseFilterRef.current;
+    const g = noiseGainRef.current?.gain;
+
+    // fréquence qui "glisse" (effet recherche)
+    const f1 = 1200 + Math.random()*1800; // 1.2–3kHz
+    const f2 = 2000 + Math.random()*3000; // 2–5kHz
+    try {
+      bp.frequency.cancelScheduledValues(now);
+      bp.frequency.setValueAtTime(f1, now);
+      bp.frequency.linearRampToValueAtTime(f2, now + durSec);
+    } catch {}
+
+    // montée du bruit
+    try {
+      g.cancelScheduledValues(now);
+      g.setTargetAtTime(targetGain, now, 0.04);
+    } catch {}
+  }
+
   async function attachMedia() {
     if (!ctxRef.current || !audioElRef.current) return;
     if (mediaSrcRef.current) return;
@@ -188,7 +243,7 @@ export default function Page() {
       mediaSrcRef.current = src; src.connect(radioGainRef.current);
       setCompat(false);
     } catch {
-      setCompat(true); // CORS bloque WebAudio
+      setCompat(true); // CORS bloque WebAudio — le bruit reste audible (il est local)
     }
   }
 
@@ -197,23 +252,18 @@ export default function Page() {
     await initAudio();
     const ctx = ctxRef.current;
     if (ctx.state === "suspended") await ctx.resume();
-
-    // met un léger bruit de fond
+    // souffle de fond
     try { noiseGainRef.current.gain.value = BASE_NOISE; } catch {}
-
     await playIndex(idxRef.current);
     setMarche(true);
   }
 
   async function powerOff() {
-    // stop balayage + lecture + bruit
     stopSweep();
     const el = audioElRef.current;
     try { noiseGainRef.current.gain.value = 0; } catch {}
     if (el) { el.pause(); el.src = ""; el.load(); }
-    // stop record si actif
     if (enr) { try { recRef.current?.stop(); } catch {} setEnr(false); }
-    // suspend l’audio (silence total)
     try { await ctxRef.current?.suspend(); } catch {}
     setMarche(false);
     setAuto(false);
@@ -221,7 +271,7 @@ export default function Page() {
     playingLockRef.current = false;
   }
 
-  /* ------- Lecture robuste d’un index (burst bruit + timeout + auto-skip) ------- */
+  /* ------- Lecture robuste (burst bruit + clic + timeout + skip) ------- */
   async function playIndex(startIndex, tries = 0) {
     const list = stationsRef.current;
     if (!list.length) return;
@@ -236,9 +286,10 @@ export default function Page() {
     const ctx = ctxRef.current;
     const now = ctx.currentTime;
     const dur = burstMs() / 1000;
-    const targetNoise = Math.min(1.15, burstGain());
+    const targetNoise = burstGain();
 
-    // burst de bruit + mute de la radio
+    // 1) clic + montée du bruit façonné, on baisse la radio
+    triggerClick(0.6);
     try {
       if (!compat) {
         radioGainRef.current.gain.cancelScheduledValues(now);
@@ -246,18 +297,18 @@ export default function Page() {
       } else {
         el.volume = 0;
       }
-      noiseGainRef.current.gain.cancelScheduledValues(now);
-      noiseGainRef.current.gain.setTargetAtTime(targetNoise, now, 0.04);
     } catch {}
+    playScanBurst(targetNoise, dur);
     setEtat("balayage…");
-    await sleep(Math.max(80, dur * 500)); // attente ~ moitié du burst
 
-    // jouer la station
+    // attendre un peu (une bonne partie du burst)
+    await sleep(Math.max(100, dur * 600));
+
+    // 2) charger / jouer
     try {
       el.crossOrigin = "anonymous";
       el.pause(); el.src = url; el.load();
 
-      // lecture avec timeout 3.5s
       const playP = el.play();
       const timeout = new Promise((_, rej) => setTimeout(() => rej(new Error("timeout")), 3500));
       await Promise.race([playP, timeout]);
@@ -265,7 +316,7 @@ export default function Page() {
       // brancher WebAudio si possible
       await attachMedia();
 
-      // fondu retour: coupe le burst, remet un bruit de fond léger
+      // 3) fondu retour : bruit → fond, radio → 1
       const after = ctx.currentTime + Math.max(0.08, dur * 0.6);
       try {
         noiseGainRef.current.gain.setTargetAtTime(BASE_NOISE, after, 0.12);
@@ -276,7 +327,7 @@ export default function Page() {
       idxRef.current = startIndex; setIdx(startIndex);
       setEtat(compat ? "lecture (compatibilité)" : "lecture");
     } catch (e) {
-      // échec → coupe le bruit, passe à la suivante
+      // Échec → couper le burst, garder le souffle de fond, passer à la suivante
       try { noiseGainRef.current.gain.setTargetAtTime(BASE_NOISE, ctx.currentTime + 0.05, 0.12); } catch {}
       const next = (startIndex + 1) % list.length;
       playingLockRef.current = false;
@@ -354,6 +405,8 @@ export default function Page() {
     <main style={styles.page}>
       <div style={styles.shadowWrap}>
         <div style={styles.cabinet}>
+          <div style={styles.textureOverlay} />
+
           {/* Titre + badges */}
           <div style={styles.headerBar}>
             <div style={styles.brandPlate}>
@@ -386,7 +439,7 @@ export default function Page() {
             <div style={styles.switches}>
               <Switch label="MARCHE" on={marche} onChange={async v => { setMarche(v); v ? await powerOn() : await powerOff(); }} />
               <Switch label="BALAYAGE AUTO" on={auto} onChange={(v) => setAuto(v)} />
-              <Bouton label={enr ? "STOP ENREG." : "ENREGISTRER"} onClick={toggleEnr} color={enr ? "#f0c14b" : "#d94242"} />
+              <Bouton label={enr ? "STOP ENREG." : "ENREGISTRER"} onClick={toggleEnr} color={enr ? "#f0c14b" : "#d96254"} />
             </div>
 
             <div style={styles.knobs}>
@@ -403,14 +456,14 @@ export default function Page() {
         <Vis at="tl" /><Vis at="tr" /><Vis at="bl" /><Vis at="br" />
       </div>
 
-      <p style={{ color: "rgba(255,255,255,0.7)", marginTop: 10, fontSize: 12 }}>
-        Tip : pour bien entendre le <em>balayage</em>, mets <strong>DÉBIT ≥ 0.6</strong> et active <strong>AUTO</strong>. MARCHE coupe tout instantanément.
+      <p style={{ color: "rgba(255,255,255,0.8)", marginTop: 10, fontSize: 12 }}>
+        Pour bien entendre le <em>balayage</em> : mets <strong>DÉBIT</strong> vers 0.7–1.0. Un petit “clic” est ajouté à chaque saut.
       </p>
     </main>
   );
 }
 
-/* ------- UI widgets ------- */
+/* ------- UI widgets (inchangés) ------- */
 
 function Knob({ label, value, onChange, hint }) {
   const [drag, setDrag] = useState(null);
@@ -460,45 +513,63 @@ function Vis({ at }) {
   return <div style={{ ...decor.screw, ...pos }} />;
 }
 
-/* ------- Styles ------- */
+/* ------- Styles (version aquarelle) ------- */
 
 const styles = {
   page: {
     minHeight: "100vh",
-    background: "radial-gradient(1600px 700px at 50% -200px, #1a1920, #0b0b10 60%)",
+    background: "linear-gradient(180deg,#1b2432 0%,#0f1723 60%,#0a0f18 100%)",
     display: "grid", placeItems: "center", padding: 24
   },
   shadowWrap: { position: "relative" },
   cabinet: {
-    width: "min(980px, 94vw)", borderRadius: 26, padding: 16,
-    border: "1px solid rgba(30,20,10,0.6)",
-    boxShadow: "0 28px 80px rgba(0,0,0,0.65), inset 0 0 0 1px rgba(255,255,255,0.03)",
-    backgroundImage: "url('/radio-vintage.svg'), linear-gradient(180deg, rgba(0,0,0,0.12), rgba(0,0,0,0.18))",
-    backgroundSize: "cover", backgroundPosition: "center",
-    position: "relative", overflow: "hidden"
+    width: "min(980px, 94vw)",
+    borderRadius: 26,
+    padding: 16,
+    border: "1px solid rgba(48,42,36,0.55)",
+    boxShadow: "0 30px 88px rgba(0,0,0,0.65), inset 0 0 0 1px rgba(255,255,255,0.04)",
+    backgroundImage: "url('/skin-watercolor.svg')",
+    backgroundSize: "cover",
+    backgroundPosition: "center",
+    backgroundBlendMode: "multiply",
+    position: "relative",
+    overflow: "hidden"
+  },
+  textureOverlay: {
+    position: "absolute",
+    inset: 0,
+    pointerEvents: "none",
+    background:
+      "radial-gradient(circle at 30% 20%, rgba(255,255,255,0.06), rgba(255,255,255,0) 60%)," +
+      "radial-gradient(circle at 70% 70%, rgba(0,0,0,0.12), rgba(0,0,0,0) 55%)"
   },
   headerBar: { display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 12 },
   brandPlate: {
-    background: "linear-gradient(180deg,#2a2b30,#1b1c23)", color: "#e8e3d6",
-    borderRadius: 10, border: "1px solid #2a2c36", padding: "8px 12px",
-    boxShadow: "inset 0 0 18px rgba(0,0,0,0.45)"
+    background: "linear-gradient(180deg,#2a2f36,#1c2129)",
+    color: "#efe6d2",
+    borderRadius: 12,
+    border: "1px solid #2a2e36",
+    padding: "10px 14px",
+    boxShadow: "inset 0 0 20px rgba(0,0,0,0.45)"
   },
-  brandText: { fontWeight: 800, letterSpacing: 2, fontSize: 13 },
-  brandSub: { fontSize: 11, opacity: 0.75 },
+  brandText: { fontFamily: "Georgia,serif", fontWeight: 800, letterSpacing: 1.5, fontSize: 14 },
+  brandSub: { fontFamily: "Georgia,serif", fontSize: 12, opacity: 0.8 },
 
   rightHeader: { display: "flex", alignItems: "center", gap: 12 },
   badge: {
-    fontSize: 12, color: "#0b0b10", background: "#f0c14b",
-    border: "1px solid #2b2e3a", padding: "4px 8px", borderRadius: 10, fontWeight: 800
+    fontSize: 12, color: "#0b0b10", background: "#e7c17a",
+    border: "1px solid rgba(70,60,45,0.6)", padding: "4px 8px", borderRadius: 10, fontWeight: 800
   },
   lampsRow: { display: "flex", gap: 14, alignItems: "center" },
 
   glass: {
-    borderRadius: 16, border: "1px solid #2b2e3a",
-    background: "linear-gradient(180deg, rgba(16,18,26,0.9), rgba(10,12,18,0.9))",
-    padding: 12, position: "relative", overflow: "hidden", boxShadow: "inset 0 0 28px rgba(0,0,0,0.5)"
+    borderRadius: 16,
+    border: "1px solid rgba(35,45,60,0.9)",
+    background: "linear-gradient(180deg, rgba(168,201,210,0.55), rgba(58,88,110,0.6))",
+    padding: 12, position: "relative", overflow: "hidden",
+    boxShadow: "inset 0 0 32px rgba(0,0,0,0.55)"
   },
-  stationRow: { display: "flex", justifyContent: "space-between", color: "#eae7f5", fontSize: 13, padding: "2px 2px" },
+  stationRow: { display: "flex", justifyContent: "space-between", color: "#f3efe6", fontSize: 13, padding: "2px 2px" },
 
   compatBanner: {
     position: "absolute", right: 10, bottom: 10,
@@ -521,25 +592,36 @@ const ui = {
   knobBlock: { display: "grid", justifyItems: "center" },
   knob: {
     width: 100, height: 100, borderRadius: "50%",
-    background: "radial-gradient(circle at 30% 30%, #5a5e68, #2a2f3a 60%, #141821 100%)",
-    border: "1px solid #1e2430",
-    boxShadow: "inset 0 12px 30px rgba(0,0,0,0.6), 0 10px 28px rgba(0,0,0,0.45)",
-    display: "grid", placeItems: "center", touchAction: "none", userSelect: "none", cursor: "grab"
+    background: "radial-gradient(circle at 32% 28%, #6d6f79, #3a3f4a 62%, #1b2230 100%)",
+    border: "1px solid rgba(28,30,38,0.9)",
+    boxShadow: "inset 0 12px 30px rgba(0,0,0,0.55), 0 8px 26px rgba(0,0,0,0.45)",
+    display: "grid", placeItems: "center",
+    touchAction: "none", userSelect: "none", cursor: "grab"
   },
-  knobIndicator: { width: 8, height: 34, borderRadius: 4, background: "#ffd28c", boxShadow: "0 0 12px rgba(255,210,140,0.55)" },
-  knobLabel: { color: "#f0e7d1", marginTop: 6, fontSize: 13, letterSpacing: 1.2, textAlign: "center" },
-  hint: { color: "rgba(255,255,255,0.65)", fontSize: 11, marginTop: 2 },
+  knobIndicator: { width: 8, height: 34, borderRadius: 4, background: "#e1b66f", boxShadow: "0 0 10px rgba(225,182,111,0.45)" },
+  knobLabel: { color: "#f0eadc", marginTop: 6, fontSize: 13, letterSpacing: 1.2, textAlign: "center", fontFamily: "Georgia,serif" },
+  hint: { color: "rgba(255,255,255,0.7)", fontSize: 11, marginTop: 2 },
 
   switchBlock: { display: "grid", gridTemplateColumns: "auto 1fr", alignItems: "center", gap: 10, cursor: "pointer" },
-  switchLabel: { color: "#f0e7d1", fontSize: 12, letterSpacing: 1.2 },
-  switch: { width: 64, height: 26, borderRadius: 16, position: "relative", border: "1px solid #2b2b36" },
-  switchDot: { width: 24, height: 24, borderRadius: "50%", background: "#0b0b10", border: "1px solid #2b2b36", position: "absolute", top: 1, left: 1, transition: "transform .15s" },
+  switchLabel: { color: "#f0eadc", fontSize: 12, letterSpacing: 1.2, fontFamily: "Georgia,serif" },
+  switch: { width: 64, height: 26, borderRadius: 16, position: "relative", border: "1px solid rgba(40,44,56,0.9)", background: "linear-gradient(180deg,#2a2f36,#20252d)" },
+  switchDot: { width: 24, height: 24, borderRadius: "50%", background: "#10151c", border: "1px solid #2b2f39", position: "absolute", top: 1, left: 1, transition: "transform .15s" },
 
-  button: { cursor: "pointer", border: "1px solid #2b2b36", borderRadius: 12, padding: "10px 14px", fontWeight: 800, fontSize: 13, color: "#0b0b10", boxShadow: "0 6px 18px rgba(0,0,0,0.35)", background: "#5b4dd6" },
+  button: {
+    cursor: "pointer",
+    border: "1px solid rgba(60,48,38,0.8)",
+    borderRadius: 12,
+    padding: "10px 14px",
+    fontWeight: 800,
+    fontSize: 13,
+    color: "#0b0b10",
+    boxShadow: "0 6px 18px rgba(0,0,0,0.35)",
+    background: "#d96254"
+  },
 
   lamp: { display: "grid", gridTemplateColumns: "auto auto", gap: 6, alignItems: "center" },
   lampDot: { width: 12, height: 12, borderRadius: "50%" },
-  lampLabel: { color: "#e0d8c0", fontSize: 11, letterSpacing: 1 }
+  lampLabel: { color: "#efe6d2", fontSize: 11, letterSpacing: 1, fontFamily: "Georgia,serif" }
 };
 
 const decor = {
