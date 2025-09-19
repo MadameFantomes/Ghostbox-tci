@@ -5,7 +5,8 @@
  * - Fusionne /public/stations.json + /public/stations-extra.json (dédoublonné)
  * - Balayage "direct" (HLS/playlist écartés) + live-edge forcé
  * - Bruit discret + ducking
- * - MICRO mixé au même fichier d’enregistrement (bus REC)
+ * - MICRO mixé dans le même fichier que la Ghostbox
+ * - Potard NIVEAU MIC + interrupteur MONITEUR MIC (écoute dans les HP)
  * - ENREGISTRER : MP3 si supporté, sinon WAV
  * - Fallback CORS : captureStream() si MediaElementSource indisponible
  */
@@ -33,13 +34,16 @@ export default function Page() {
   const recordMixRef = useRef(null);     // bus REC (master + mic)
   const destRef = useRef(null);          // MediaStreamDestination (REC)
 
-  // Sources
-  const mediaSrcRef = useRef(null);      // node pour la radio (MediaElementSource OU captureStream source)
+  // Radio source
+  const mediaSrcRef = useRef(null);
   const radioGainRef = useRef(null);
 
   // Micro
   const micSrcRef = useRef(null);
-  const micGainRef = useRef(null);
+  const micHPRef  = useRef(null);
+  const micCompRef= useRef(null);
+  const micGainRef= useRef(null);        // niveau envoyé dans REC (+ moniteur)
+  const micMonGainRef = useRef(null);    // niveau de monitoring vers HP
   const micStreamRef = useRef(null);
 
   // Bruit
@@ -74,9 +78,11 @@ export default function Page() {
   const [etat, setEtat] = useState("prêt");
   const [marche, setMarche] = useState(false);
   const [auto, setAuto] = useState(false);
-  const [compat, setCompat] = useState(false);  // compat = on lit sans traitement (si aucun ancrage au graphe)
+  const [compat, setCompat] = useState(false);
   const [micOn, setMicOn] = useState(false);
   const [micErr, setMicErr] = useState("");
+  const [monitor, setMonitor] = useState(false);
+  const [micLevel, setMicLevel] = useState(1.0); // potard niveau mic (REC + moniteur)
   const sweepTimerRef = useRef(null);
   const playingLockRef = useRef(false);
 
@@ -148,10 +154,7 @@ export default function Page() {
         });
       });
     }
-    for (let i = list.length - 1; i > 0; i--) {
-      const j = Math.floor(Math.random() * (i + 1));
-      [list[i], list[j]] = [list[j], list[i]];
-    }
+    for (let i = list.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [list[i], list[j]] = [list[j], list[i]]; }
     return list;
   }
 
@@ -198,14 +201,14 @@ export default function Page() {
     noiseHPRef.current = hpN; noiseFilterRef.current = bp; noiseLPRef.current = lpN;
     const gNoise = ctx.createGain(); gNoise.gain.value = 0; noiseGainRef.current = gNoise;
 
-    // Auto filtre radio
+    // Radio auto-filtre
     const hp = ctx.createBiquadFilter();  hp.type = "highpass"; hp.frequency.value = 320; hp.Q.value = 0.7;
     const lp = ctx.createBiquadFilter();  lp.type = "lowpass";  lp.frequency.value = 3400; lp.Q.value = 0.7;
     const shelf = ctx.createBiquadFilter(); shelf.type = "highshelf"; shelf.frequency.value = 2500; shelf.gain.value = -4;
     const drive = createDriveNode(ctx, 0.22);
     radioHPRef.current = hp; radioLPRef.current = lp; radioShelfRef.current = shelf; driveRef.current = drive;
 
-    // Dry & Écho
+    // Dry & ÉCHO
     const dry = ctx.createGain(); dry.gain.value = 1; dryRef.current = dry;
     const dly = ctx.createDelay(1.2); dly.delayTime.value = 0.34;
     const fb  = ctx.createGain(); fb.gain.value = 0.25;
@@ -262,7 +265,7 @@ export default function Page() {
     } catch {}
   }
 
-  /* ===== Attacher la radio au graphe (avec fallback captureStream) ===== */
+  /* ===== Attacher la radio (avec fallback captureStream) ===== */
   async function attachMedia() {
     if (!ctxRef.current || !audioElRef.current) return;
     if (mediaSrcRef.current) return;
@@ -270,7 +273,6 @@ export default function Page() {
     const ctx = ctxRef.current;
     const el = audioElRef.current;
 
-    // 1) Tentative standard : MediaElementSource
     try {
       const src = ctx.createMediaElementSource(el);
       mediaSrcRef.current = src;
@@ -287,11 +289,8 @@ export default function Page() {
 
       setCompat(false);
       return;
-    } catch (e) {
-      // continue vers fallback
-    }
+    } catch {}
 
-    // 2) Fallback : captureStream() → MediaStreamSource
     try {
       const stream = el.captureStream?.();
       if (stream && stream.getAudioTracks().length > 0) {
@@ -308,22 +307,21 @@ export default function Page() {
           src2.connect(radioGainRef.current);
         }
 
-        setCompat(false); // on a une vraie source dans le graphe
+        setCompat(false);
         return;
       }
-    } catch (e) {}
+    } catch {}
 
-    // 3) Impossible d’ancrer la radio : compat à true (lecture sans mixage au graphe)
-    setCompat(true);
+    setCompat(true); // pas ancré (lecture sans traitement); le REC prendra quand même master (sans radio)
   }
 
-  /* ===== Micro (dans REC uniquement) ===== */
+  /* ===== Micro (REC + moniteur optionnel) ===== */
   async function toggleMic(on) {
     setMicErr("");
     if (!on) {
-      try { micSrcRef.current?.disconnect(); micGainRef.current?.disconnect(); } catch {}
+      try { micSrcRef.current?.disconnect(); micGainRef.current?.disconnect(); micMonGainRef.current?.disconnect(); micHPRef.current?.disconnect(); micCompRef.current?.disconnect(); } catch {}
       try { micStreamRef.current?.getTracks().forEach(t => t.stop()); } catch {}
-      micSrcRef.current = null; micGainRef.current = null; micStreamRef.current = null;
+      micSrcRef.current = null; micGainRef.current = null; micMonGainRef.current = null; micHPRef.current = null; micCompRef.current = null; micStreamRef.current = null;
       setMicOn(false);
       return true;
     }
@@ -331,15 +329,28 @@ export default function Page() {
       await initAudio();
       const ctx = ctxRef.current;
       const stream = await navigator.mediaDevices.getUserMedia({
-        audio: { channelCount: 2, echoCancellation: true, noiseSuppression: true, autoGainControl: false }
+        audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: false }
       });
       micStreamRef.current = stream;
-      const mic = ctx.createMediaStreamSource(stream);
-      const micGain = ctx.createGain(); micGain.gain.value = 1.0;
-      mic.connect(micGain);
-      // IMPORTANT : micro vers bus REC seulement
-      micGain.connect(recordMixRef.current);
-      micSrcRef.current = mic; micGainRef.current = micGain;
+
+      // Chaîne mic : Source → HP 120 Hz → Compresseur doux → micGain
+      const src = ctx.createMediaStreamSource(stream);
+      const hp = ctx.createBiquadFilter(); hp.type = "highpass"; hp.frequency.value = 120; hp.Q.value = 0.7;
+      const comp = ctx.createDynamicsCompressor();
+      comp.threshold.value = -24; comp.knee.value = 20; comp.ratio.value = 3; comp.attack.value = 0.01; comp.release.value = 0.25;
+      const g = ctx.createGain(); g.gain.value = micLevel; // potard
+
+      src.connect(hp); hp.connect(comp); comp.connect(g);
+      // Vers REC (toujours)
+      g.connect(recordMixRef.current);
+
+      // Moniteur (vers HP) — connecté/déconnecté selon l'état "monitor"
+      const mon = ctx.createGain(); mon.gain.value = monitor ? 0.18 : 0; // -15 dB env.
+      g.connect(mon); mon.connect(masterRef.current);
+
+      micSrcRef.current = src; micHPRef.current = hp; micCompRef.current = comp;
+      micGainRef.current = g; micMonGainRef.current = mon;
+
       setMicOn(true);
       return true;
     } catch (e) {
@@ -348,6 +359,10 @@ export default function Page() {
       return false;
     }
   }
+
+  // React aux potards mic & monitor
+  useEffect(() => { if (micGainRef.current) micGainRef.current.gain.value = clamp01(micLevel) * 2.0; }, [micLevel]);
+  useEffect(() => { if (micMonGainRef.current) micMonGainRef.current.gain.value = monitor ? 0.18 : 0; }, [monitor]);
 
   /* ===== Power / Lecture ===== */
   async function powerOn() {
@@ -405,9 +420,8 @@ export default function Page() {
     for (let i = 0; i <= steps; i++) {
       const t = now + (durSec * i) / steps;
       const x = i / steps;
-      const f = (x < 0.6)
-        ? fStart + (fMid - fStart) * (x / 0.6)
-        : fMid   + (fEnd - fMid)   * ((x - 0.6) / 0.4);
+      const f = (x < 0.6) ? fStart + (fMid - fStart) * (x / 0.6)
+                          : fMid   + (fEnd - fMid)   * ((x - 0.6) / 0.4);
       const jitter = (Math.random()*2 - 1) * (80 + 380*(1 - debit));
       try { bp.frequency.linearRampToValueAtTime(Math.max(300, f + jitter), t); } catch {}
     }
@@ -468,7 +482,7 @@ export default function Page() {
       const timeout = new Promise((_, rej) => setTimeout(() => rej(new Error("timeout")), 3500));
       await Promise.race([playP, timeout]);
 
-      await attachMedia(); // <— ANCRAGE au graphe (MediaElementSource OU captureStream)
+      await attachMedia();
       applyAutoFilterProfile();
 
       const after = ctx.currentTime + Math.max(0.08, dur * 0.6);
@@ -511,9 +525,15 @@ export default function Page() {
   async function startRecording() {
     await initAudio();
 
-    // Auto-armer le micro si pas déjà ON (pour garantir mix Ghostbox+Mic)
-    if (!micOn) { await toggleMic(true); }
+    // 1) Armer le micro AVANT de démarrer
+    if (!micOn) {
+      const ok = await toggleMic(true);
+      if (!ok) {
+        setMicErr("Micro indisponible : l’enregistrement ne contiendra que la radio.");
+      }
+    }
 
+    // 2) MP3 si supporté
     if (supportsType("audio/mpeg")) {
       const rec = new MediaRecorder(destRef.current.stream, { mimeType: "audio/mpeg" });
       chunksRef.current = [];
@@ -528,7 +548,7 @@ export default function Page() {
       return;
     }
 
-    // Fallback WAV (ScriptProcessor)
+    // 3) WAV (fallback)
     const ctx = ctxRef.current;
     const proc = ctx.createScriptProcessor(4096, 2, 2);
     wavRecRef.current = { active: true, proc, buffersL: [], buffersR: [], length: 0 };
@@ -546,12 +566,10 @@ export default function Page() {
   }
 
   function stopRecording() {
-    // MP3
     if (recRef.current && recRef.current.state !== "inactive") {
       try { recRef.current.stop(); } catch {}
       recRef.current = null; setEnr(false); return;
     }
-    // WAV
     if (!wavRecRef.current.active) return;
     wavRecRef.current.active = false;
     try { recordMixRef.current.disconnect(wavRecRef.current.proc); } catch {}
@@ -659,7 +677,7 @@ export default function Page() {
               <div><strong>{currentName || "—"}</strong></div>
               <div><em style={{ opacity: 0.9 }}>{etat}</em></div>
             </div>
-            {compat && <div style={styles.compatBanner}>Compat : radio non câblée (CORS), mais captureStream tenté pour le REC.</div>}
+            {compat && <div style={styles.compatBanner}>Compat : captureStream tentée pour inclure la radio au REC.</div>}
             {micErr && <div style={styles.warnBanner}>Micro : {micErr}</div>}
           </div>
 
@@ -668,6 +686,7 @@ export default function Page() {
               <Switch label="MARCHE" on={marche} onChange={async v => { setMarche(v); v ? await powerOn() : await powerOff(); }} />
               <Switch label="BALAYAGE AUTO" on={auto} onChange={(v) => setAuto(v)} />
               <Switch label="MICRO ENR" on={micOn} onChange={(v) => toggleMic(v)} />
+              <Switch label="MONITEUR MIC" on={monitor} onChange={(v) => setMonitor(v)} />
               <Bouton label={enr ? (supportsType("audio/mpeg") ? "STOP ENREG. (MP3)" : "STOP ENREG. (WAV)") : "ENREGISTRER"} onClick={toggleEnr} color={enr ? "#f0c14b" : "#d96254"} />
             </div>
 
@@ -676,6 +695,7 @@ export default function Page() {
               <Knob label="VOLUME"  value={volume}  onChange={(v) => setVolume(clamp01(v))} />
               <Knob label="ÉCHO"    value={echo}    onChange={(v) => setEcho(clamp01(v))} />
               <Knob label="DÉBIT"   value={debit}   onChange={(v) => setDebit(clamp01(v))} hint={`${burstMs()} ms de bruit`} />
+              <Knob label="NIVEAU MIC" value={micLevel} onChange={(v) => setMicLevel(clamp01(v))} />
             </div>
           </div>
 
@@ -686,7 +706,8 @@ export default function Page() {
       </div>
 
       <p style={{ color: "rgba(255,255,255,0.8)", marginTop: 10, fontSize: 12 }}>
-        L’enregistrement mélange toujours Ghostbox + Micro dans un seul fichier (MP3 si possible, sinon WAV).
+        L’enregistrement mélange Ghostbox + Micro dans un seul fichier (MP3 si possible, sinon WAV).
+        Active “MONITEUR MIC” si tu veux t’entendre dans les HP (attention au larsen).
       </p>
     </main>
   );
@@ -766,7 +787,7 @@ const styles = {
   warnBanner: { position: "absolute", left: 10, bottom: 10, background: "rgba(255,80,80,0.18)", border: "1px solid rgba(255,80,80,0.35)", color: "#ff8c8c", padding: "6px 10px", borderRadius: 8, fontSize: 12 },
   controlsRow: { marginTop: 16, display: "grid", gridTemplateColumns: "1fr 2fr", gap: 14, alignItems: "center" },
   switches: { display: "grid", gap: 10, alignContent: "start" },
-  knobs: { display: "grid", gridTemplateColumns: "repeat(4, minmax(120px, 1fr))", gap: 14, alignItems: "center", justifyItems: "center" }
+  knobs: { display: "grid", gridTemplateColumns: "repeat(5, minmax(120px, 1fr))", gap: 14, alignItems: "center", justifyItems: "center" }
 };
 const ui = {
   knobBlock: { display: "grid", justifyItems: "center" },
