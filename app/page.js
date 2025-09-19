@@ -1,22 +1,21 @@
 "use client";
 
 /**
- * Ghostbox TCI — Radio Vintage (live)
- * - Vraies stations (HTTPS/CORS-friendly)
- * - POWER, TUNING, VOLUME, NOISE, FILTER (band-pass), AUTO SWEEP + vitesse
- * - Enregistrement .webm (MediaRecorder)
- * - VU-mètres animés (AnalyserNode)
- * - UI 100% CSS (bois, vitre, vis, cadran rétro)
+ * Ghostbox TCI — Radio Vintage (FR)
+ * - Radio live (HTTPS)
+ * - Mode normal (WebAudio complet) + Mode compatibilité (si CORS bloque)
+ * - Contrôles FR : MARCHE, RÉGLAGE, VOLUME, BRUIT, FILTRE, BALAYAGE AUTO, VITESSE, ENREGISTRER
+ * - VU-mètres, enregistrement .webm
  */
 
 import React, { useEffect, useRef, useState } from "react";
 
-// —————————————————— Stations (tu peux en ajouter) ——————————————————
+// —————————————————— Stations conseillées (MP3 d'abord) ——————————————————
 const STATIONS = [
-  { name: "RadioMast MP3", url: "https://streams.radiomast.io/reference-mp3" },
-  { name: "RadioMast AAC", url: "https://streams.radiomast.io/reference-aac" },
-  { name: "Swiss Jazz (96k)", url: "https://stream.srg-ssr.ch/srgssr/rsj/aac/96" },
-  { name: "Swiss Classic (96k)", url: "https://stream.srg-ssr.ch/srgssr/rsc/aac/96" }
+  { name: "Référence MP3 (RadioMast)", url: "https://streams.radiomast.io/reference-mp3" }, // MP3: bon pour tests
+  { name: "Référence AAC (RadioMast)", url: "https://streams.radiomast.io/reference-aac" },  // AAC: selon navigateur
+  { name: "Swiss Jazz 96k (AAC)",      url: "https://stream.srg-ssr.ch/srgssr/rsj/aac/96" },
+  { name: "Swiss Classic 96k (AAC)",   url: "https://stream.srg-ssr.ch/srgssr/rsc/aac/96" }
 ];
 
 export default function Page() {
@@ -33,34 +32,35 @@ export default function Page() {
   const bandpassRef = useRef(null);
   const analyserRef = useRef(null);
 
-  // UI state
-  const [power, setPower] = useState(false);
+  // UI
+  const [marche, setMarche] = useState(false);
   const [stationIndex, setStationIndex] = useState(0);
-  const [status, setStatus] = useState("prêt");
+  const [etat, setEtat] = useState("prêt");
 
-  const [volume, setVolume] = useState(0.9);
-  const [noise, setNoise] = useState(0.25);
-  const [filterOn, setFilterOn] = useState(true);
-  const [q, setQ] = useState(1.2);
+  const [volume, setVolume] = useState(0.9);   // niveau radio
+  const [bruit, setBruit]   = useState(0.25);  // bruit blanc
+  const [filtre, setFiltre] = useState(true);
+  const [q, setQ]     = useState(1.2);
   const [fMin, setFMin] = useState(280);
-  const [fMax] = useState(3800); // (affiché, range futur si tu veux balayer en continu)
 
   const [autoSweep, setAutoSweep] = useState(false);
-  const [sweepSpeed, setSweepSpeed] = useState(0.45); // 0..1 (→ ms)
+  const [vitesse, setVitesse] = useState(0.45); // 0..1  → 300..2000ms
   const sweepTimerRef = useRef(null);
 
-  // Recorder
-  const [isRecording, setIsRecording] = useState(false);
+  // Mode compatibilité (CORS)
+  const [compat, setCompat] = useState(false);
+
+  // Record
+  const [enr, setEnr] = useState(false);
   const recRef = useRef(null);
   const chunksRef = useRef([]);
 
-  // VU meter level (0..1)
-  const [vuL, setVuL] = useState(0);
-  const [vuR, setVuR] = useState(0);
+  // VU
+  const [vuG, setVuG] = useState(0);
+  const [vuD, setVuD] = useState(0);
 
-  // Helpers
-  function clamp01(x) { return Math.max(0, Math.min(1, x)); }
-  function msFromSpeed(v) { return Math.round(300 + v * (2000 - 300)); } // 300ms rapide → 2000ms lent
+  const clamp01 = (x) => Math.max(0, Math.min(1, x));
+  const msFromSpeed = (v) => Math.round(300 + v * (2000 - 300)); // 300ms → 2000ms
 
   // ——— Init
   async function initAudio() {
@@ -68,48 +68,44 @@ export default function Page() {
     const ctx = new (window.AudioContext || window.webkitAudioContext)();
     ctxRef.current = ctx;
 
-    // master
     const master = ctx.createGain();
     master.gain.value = 1;
     master.connect(ctx.destination);
     masterGainRef.current = master;
 
-    // enregistrement
     const dest = ctx.createMediaStreamDestination();
     master.connect(dest);
     destRef.current = dest;
 
-    // bandpass
     const band = ctx.createBiquadFilter();
     band.type = "bandpass";
     band.Q.value = q;
     band.frequency.value = fMin;
     bandpassRef.current = band;
 
-    // gains
     const gRadio = ctx.createGain(); gRadio.gain.value = volume; radioGainRef.current = gRadio;
-    const gNoise = ctx.createGain(); gNoise.gain.value = noise;  noiseGainRef.current = gNoise;
+    const gNoise = ctx.createGain(); gNoise.gain.value = bruit;  noiseGainRef.current = gNoise;
 
-    // bruit blanc
-    const n = createNoiseNode(ctx); noiseNodeRef.current = n;
+    const noise = createNoiseNode(ctx); noiseNodeRef.current = noise;
 
-    // analyser pour VU
     const analyser = ctx.createAnalyser();
     analyser.fftSize = 512;
     analyserRef.current = analyser;
 
-    // routing
-    rechain(filterOn);
-    // brancher le master AU-DESSUS de destination sur l'analyseur
+    rechain(filtre, /*compat*/ false);
     master.connect(analyser);
     startVuLoop();
   }
 
-  function rechain(useFilter) {
+  function rechain(useFilter, compatMode) {
     try { radioGainRef.current?.disconnect(); } catch {}
     try { noiseGainRef.current?.disconnect(); } catch {}
     try { bandpassRef.current?.disconnect(); } catch {}
-
+    if (compatMode) {
+      // en compat: seule la chaîne BRUIT passe par WebAudio (la radio lit directement)
+      noiseGainRef.current.connect(masterGainRef.current);
+      return;
+    }
     if (useFilter) {
       radioGainRef.current.connect(bandpassRef.current);
       noiseGainRef.current.connect(bandpassRef.current);
@@ -131,55 +127,69 @@ export default function Page() {
   }
 
   async function attachMedia() {
+    // essaie de brancher la radio au graphe WebAudio
     if (!ctxRef.current || !audioElRef.current) return;
     if (mediaSrcRef.current) {
       try { mediaSrcRef.current.disconnect(); } catch {}
       mediaSrcRef.current = null;
     }
-    const src = ctxRef.current.createMediaElementSource(audioElRef.current);
-    mediaSrcRef.current = src;
-    src.connect(radioGainRef.current);
+    try {
+      const src = ctxRef.current.createMediaElementSource(audioElRef.current);
+      mediaSrcRef.current = src;
+      src.connect(radioGainRef.current);
+      setCompat(false); // succès : effet complet dispo
+    } catch {
+      // échec : CORS → compat
+      setCompat(true);
+    }
   }
 
-  // ——— Power
-  async function powerOn() {
+  // ——— MARCHE
+  async function marcheOn() {
     await initAudio();
     const ctx = ctxRef.current;
     if (ctx.state === "suspended") await ctx.resume();
     try { noiseNodeRef.current.start(0); } catch {}
     await attachMedia();
     await tuneTo(stationIndex);
-    setPower(true);
+    setMarche(true);
   }
-  function powerOff() {
+  function marcheOff() {
     stopSweepTimer();
     if (audioElRef.current) {
       audioElRef.current.pause();
       audioElRef.current.src = "";
       audioElRef.current.load();
     }
-    setPower(false);
-    setStatus("arrêté");
+    setMarche(false);
+    setEtat("arrêté");
   }
 
   // ——— Tuning
   async function tuneTo(index) {
-    if (!audioElRef.current) return;
     const el = audioElRef.current;
+    if (!el) return;
     const { url } = STATIONS[index];
 
-    // petit fondu "scan"
-    smooth(radioGainRef.current.gain, Math.max(0.12, volume * 0.25), 0.12);
-    smooth(noiseGainRef.current.gain, Math.max(noise, 0.28), 0.12);
+    // petit fondu “scan”
+    smooth(noiseGainRef.current.gain, Math.max(bruit, 0.28), 0.12);
+    if (!compat) smooth(radioGainRef.current.gain, Math.max(0.12, volume * 0.25), 0.12);
 
-    el.pause(); el.src = url; setStatus("connexion…");
+    el.crossOrigin = "anonymous"; // important avant src
+    el.src = url;
+    setEtat("connexion…");
     try {
+      // en mode compat, on contrôle le volume de la balise <audio>
+      el.volume = compat ? clamp01(volume) : 1.0;
+
       await el.play();
-      setStatus("lecture");
-      smooth(radioGainRef.current.gain, volume, 0.28);
-      smooth(noiseGainRef.current.gain, noise, 0.38);
+      setEtat(compat ? "lecture (compatibilité)" : "lecture");
+      if (!compat) {
+        smooth(radioGainRef.current.gain, volume, 0.28);
+      }
+      smooth(noiseGainRef.current.gain, bruit, 0.38);
     } catch {
-      setStatus("échec (CORS/format)");
+      setEtat("échec (CORS/format)");
     }
   }
 
@@ -192,14 +202,14 @@ export default function Page() {
     } catch {}
   }
 
-  // ——— Auto sweep
+  // ——— Balayage auto
   function startSweepTimer() {
     stopSweepTimer();
-    const interval = msFromSpeed(sweepSpeed);
+    const interval = msFromSpeed(vitesse);
     sweepTimerRef.current = setInterval(() => {
       setStationIndex(prev => {
         const next = (prev + 1) % STATIONS.length;
-        if (power) tuneTo(next);
+        if (marche) tuneTo(next);
         return next;
       });
     }, interval);
@@ -209,10 +219,10 @@ export default function Page() {
     sweepTimerRef.current = null;
   }
 
-  // ——— Record
-  function toggleRecord() {
+  // ——— Enregistrer
+  function toggleEnr() {
     if (!destRef.current) return;
-    if (!isRecording) {
+    if (!enr) {
       const rec = new MediaRecorder(destRef.current.stream, { mimeType: "audio/webm;codecs=opus" });
       chunksRef.current = [];
       rec.ondataavailable = (e) => { if (e.data.size) chunksRef.current.push(e.data); };
@@ -224,160 +234,145 @@ export default function Page() {
         document.body.appendChild(a); a.click();
         setTimeout(()=>{ document.body.removeChild(a); URL.revokeObjectURL(url); },0);
       };
-      rec.start(); recRef.current = rec; setIsRecording(true);
+      rec.start(); recRef.current = rec; setEnr(true);
     } else {
-      recRef.current?.stop(); setIsRecording(false);
+      recRef.current?.stop(); setEnr(false);
     }
   }
 
-  // ——— React to UI changes
-  useEffect(() => { if (radioGainRef.current) radioGainRef.current.gain.value = volume; }, [volume]);
-  useEffect(() => { if (noiseGainRef.current)  noiseGainRef.current.gain.value  = noise; }, [noise]);
+  // ——— Réactions
+  useEffect(() => { if (radioGainRef.current) radioGainRef.current.gain.value = volume; if (audioElRef.current && compat) audioElRef.current.volume = clamp01(volume); }, [volume, compat]);
+  useEffect(() => { if (noiseGainRef.current)  noiseGainRef.current.gain.value  = bruit; }, [bruit]);
   useEffect(() => { if (bandpassRef.current)   bandpassRef.current.Q.value     = q; }, [q]);
   useEffect(() => { if (bandpassRef.current)   bandpassRef.current.frequency.value = Math.max(60, fMin); }, [fMin]);
-  useEffect(() => { if (ctxRef.current) rechain(filterOn); }, [filterOn]);
+  useEffect(() => { if (ctxRef.current) rechain(filtre, compat); }, [filtre, compat]);
 
   useEffect(() => {
     if (!autoSweep) { stopSweepTimer(); return; }
     startSweepTimer();
     return stopSweepTimer;
-  }, [autoSweep, sweepSpeed, power]);
+  }, [autoSweep, vitesse, marche]);
 
-  // ——— VU meter loop
+  // ——— VU
   function startVuLoop() {
     const analyser = analyserRef.current;
     if (!analyser) return;
     const data = new Uint8Array(analyser.fftSize);
     function loop() {
       analyser.getByteTimeDomainData(data);
-      // RMS approx
       let sum = 0;
       for (let i = 0; i < data.length; i++) {
         const v = (data[i] - 128) / 128;
         sum += v * v;
       }
-      const rms = Math.sqrt(sum / data.length); // 0..~1
+      const rms = Math.sqrt(sum / data.length);
       const lvl = Math.min(1, rms * 1.8);
-      // Joue un peu sur L/R pour l’esthétique
-      setVuL(l => l * 0.7 + lvl * 0.3);
-      setVuR(r => r * 0.7 + (lvl * 0.9) * 0.3);
+      setVuG(l => l * 0.7 + lvl * 0.3);
+      setVuD(r => r * 0.7 + (lvl * 0.9) * 0.3);
       requestAnimationFrame(loop);
     }
     requestAnimationFrame(loop);
   }
 
-  // ——— UI computed
+  // ——— UI
   const tuneValue = STATIONS.length > 1 ? stationIndex / (STATIONS.length - 1) : 0;
 
   return (
     <main style={styles.page}>
       <div style={styles.shadowWrap}>
         <div style={styles.cabinet}>
-          {/* Plaque marque + lampes */}
+          {/* entête */}
           <div style={styles.headerBar}>
             <div style={styles.brandPlate}>
               <div style={styles.brandText}>MADAME FANTÔMES</div>
-              <div style={styles.brandSub}>Ghostbox • TCI</div>
+              <div style={styles.brandSub}>Ghostbox • Formation TCI</div>
             </div>
             <div style={styles.lampsRow}>
-              <Lamp label="POWER" on={power} />
-              <Lamp label="REC" on={isRecording} colorOn="#ff5656" />
+              <Lamp label="MARCHE" on={marche} />
+              <Lamp label="ENR" on={enr} colorOn="#ff5656" />
             </div>
           </div>
 
-          {/* Vitre + cadran */}
+          {/* cadran */}
           <div style={styles.glass}>
             <div style={styles.scaleWrap}>
               <div style={styles.scaleGrid} />
-              {/* Ticks & labels */}
               {STATIONS.map((s, i) => (
                 <div key={s.url} style={{ ...styles.tick, left: `${(i/(STATIONS.length-1))*100}%` }} />
               ))}
               <div style={{ ...styles.needle, left: `${tuneValue*100}%` }} />
             </div>
             <div style={styles.stationRow}>
-              <div style={styles.stationLeft}>
-                <strong>{STATIONS[stationIndex].name}</strong>
-              </div>
-              <div style={styles.stationRight}>
-                <em style={{ opacity: 0.9 }}>{status}</em>
-              </div>
+              <div><strong>{STATIONS[stationIndex].name}</strong></div>
+              <div><em style={{ opacity: 0.9 }}>{etat}</em></div>
             </div>
-            {/* Micro-rayures */}
+            {compat && (
+              <div style={styles.compatBanner}>
+                Mode compatibilité CORS : filtre inactif sur la radio
+              </div>
+            )}
             <div style={styles.scratches} aria-hidden />
           </div>
 
-          {/* Grille + VU meters */}
+          {/* grille + VU */}
           <div style={styles.speakerSection}>
             <div style={styles.grill} />
             <div style={styles.vuWrap}>
-              <VuMeter label="VU L" value={vuL} />
-              <VuMeter label="VU R" value={vuR} />
+              <Vu label="NIVEAU G" value={vuG} />
+              <Vu label="NIVEAU D" value={vuD} />
             </div>
           </div>
 
-          {/* Contrôles */}
+          {/* contrôles */}
           <div style={styles.controlsRow}>
-            {/* Col. gauche */}
             <div style={styles.colLeft}>
-              <ToggleSwitch
-                label="POWER"
-                on={power}
-                onChange={async v => { setPower(v); v ? await powerOn() : powerOff(); }}
-              />
-              <ToggleSwitch label="FILTER" on={filterOn} onChange={setFilterOn} />
-              <ToggleSwitch label="AUTO SWEEP" on={autoSweep} onChange={setAutoSweep} />
-              <Knob label="SWEEP" value={sweepSpeed} onChange={v => setSweepSpeed(clamp01(v))} hint={`${msFromSpeed(sweepSpeed)} ms`} />
+              <Switch label="MARCHE" on={marche} onChange={async v => { setMarche(v); v ? await marcheOn() : marcheOff(); }} />
+              <Switch label="FILTRE" on={filtre} onChange={setFiltre} />
+              <Switch label="BALAYAGE AUTO" on={autoSweep} onChange={setAutoSweep} />
+              <Knob label="VITESSE" value={vitesse} onChange={v => setVitesse(clamp01(v))} hint={`${msFromSpeed(vitesse)} ms`} />
             </div>
 
-            {/* Col. centre */}
             <div style={styles.colCenter}>
               <Knob label="VOLUME" value={volume} onChange={v => setVolume(clamp01(v))} />
-              <Knob label="NOISE" value={noise} onChange={v => setNoise(clamp01(v))} />
-              <Button label={isRecording ? "STOP" : "RECORD"} color={isRecording ? "#f0c14b" : "#d94242"} onClick={toggleRecord} />
+              <Knob label="BRUIT"   value={bruit} onChange={v => setBruit(clamp01(v))} />
+              <Bouton label={enr ? "STOP" : "ENREGISTRER"} color={enr ? "#f0c14b" : "#d94242"} onClick={toggleEnr} />
             </div>
 
-            {/* Col. droite */}
             <div style={styles.colRight}>
               <BigKnob
-                label="TUNING"
+                label="RÉGLAGE"
                 value={tuneValue}
                 onChange={async v => {
                   const idx = Math.round(clamp01(v) * (STATIONS.length - 1));
                   setStationIndex(idx);
-                  if (power) await tuneTo(idx);
+                  if (marche) await tuneTo(idx);
                 }}
               />
               <div style={styles.subDials}>
                 <MiniDial label="Q" min={0.4} max={6} step={0.1} value={q} setValue={setQ} />
                 <MiniDial label="fMin" min={60} max={2000} step={20} value={fMin} setValue={setFMin} />
-                <Button label="NEXT" onClick={async () => {
+                <Bouton label="SUIVANTE" onClick={async () => {
                   const next = (stationIndex + 1) % STATIONS.length;
-                  setStationIndex(next); if (power) await tuneTo(next);
+                  setStationIndex(next); if (marche) await tuneTo(next);
                 }} />
               </div>
             </div>
           </div>
 
-          {/* Audio element */}
           <audio ref={audioElRef} crossOrigin="anonymous" preload="none" style={{ display: "none" }} />
         </div>
 
-        {/* Décor : vis */}
-        <Screw at="tl" />
-        <Screw at="tr" />
-        <Screw at="bl" />
-        <Screw at="br" />
+        <Vis at="tl" /><Vis at="tr" /><Vis at="bl" /><Vis at="br" />
       </div>
 
       <p style={{ color: "rgba(255,255,255,0.7)", marginTop: 14, fontSize: 12 }}>
-        Conseil : clique d’abord <strong>POWER</strong>, puis joue avec <strong>TUNING</strong>, <strong>FILTER</strong> et <strong>NOISE</strong>.
+        Tip : active <strong>MARCHE</strong> puis joue avec <strong>RÉGLAGE</strong>, <strong>FILTRE</strong> et <strong>BRUIT</strong>.
       </p>
     </main>
   );
 }
 
-/* —————————————— UI widgets —————————————— */
+/* ————— Widgets UI ————— */
 
 function Knob({ label, value, onChange, hint }) {
   const [drag, setDrag] = useState(null);
@@ -387,9 +382,8 @@ function Knob({ label, value, onChange, hint }) {
       <div
         style={{ ...ui.knob, transform: `rotate(${angle}deg)` }}
         onPointerDown={(e) => { e.currentTarget.setPointerCapture(e.pointerId); setDrag({ y: e.clientY, v: value }); }}
-        onPointerMove={(e) => { if (!drag) return; const delta = (drag.y - e.clientY) / 220; onChange(drag.v + delta); }}
-        onPointerUp={() => setDrag(null)}
-        onPointerCancel={() => setDrag(null)}
+        onPointerMove={(e) => { if (!drag) return; const d = (drag.y - e.clientY) / 220; onChange(drag.v + d); }}
+        onPointerUp={() => setDrag(null)} onPointerCancel={() => setDrag(null)}
         aria-label={label}
       >
         <div style={ui.knobIndicator} />
@@ -408,14 +402,8 @@ function BigKnob({ label, value, onChange }) {
       <div
         style={{ ...ui.bigKnob, transform: `rotate(${angle}deg)` }}
         onPointerDown={(e) => { e.currentTarget.setPointerCapture(e.pointerId); setDrag({ x: e.clientX, y: e.clientY, v: value }); }}
-        onPointerMove={(e) => {
-          if (!drag) return;
-          const dy = (drag.y - e.clientY) / 340;
-          const dx = (e.clientX - drag.x) / 420;
-          onChange(drag.v + dy + dx * 0.25);
-        }}
-        onPointerUp={() => setDrag(null)}
-        onPointerCancel={() => setDrag(null)}
+        onPointerMove={(e) => { if (!drag) return; const dy = (drag.y - e.clientY) / 340; const dx = (e.clientX - drag.x) / 420; onChange(drag.v + dy + dx * 0.25); }}
+        onPointerUp={() => setDrag(null)} onPointerCancel={() => setDrag(null)}
       >
         <div style={ui.bigKnobIndicator} />
       </div>
@@ -424,7 +412,7 @@ function BigKnob({ label, value, onChange }) {
   );
 }
 
-function ToggleSwitch({ label, on, onChange }) {
+function Switch({ label, on, onChange }) {
   return (
     <div style={ui.switchBlock} onClick={() => onChange(!on)}>
       <div style={ui.switchLabel}>{label}</div>
@@ -435,7 +423,7 @@ function ToggleSwitch({ label, on, onChange }) {
   );
 }
 
-function Button({ label, onClick, color = "#5b4dd6" }) {
+function Bouton({ label, onClick, color = "#5b4dd6" }) {
   return <button onClick={onClick} style={{ ...ui.button, background: color }}>{label}</button>;
 }
 
@@ -458,72 +446,44 @@ function MiniDial({ label, min, max, step, value, setValue }) {
   );
 }
 
-function VuMeter({ label, value }) {
-  const pct = Math.round(clamp01(value) * 100);
-  const color =
-    pct < 60 ? "#7bdc8b" :
-    pct < 85 ? "#f0c14b" :
-    "#ff6a6a";
+function Vu({ label, value }) {
+  const pct = Math.round(Math.max(0, Math.min(1, value)) * 100);
+  const color = pct < 60 ? "#7bdc8b" : pct < 85 ? "#f0c14b" : "#ff6a6a";
   return (
     <div style={vu.box}>
-      <div style={vu.scale}>
-        <div style={{ ...vu.bar, width: `${pct}%`, background: color }} />
-      </div>
+      <div style={vu.scale}><div style={{ ...vu.bar, width: `${pct}%`, background: color }} /></div>
       <div style={vu.label}>{label}</div>
     </div>
   );
-  function clamp01(x) { return Math.max(0, Math.min(1, x)); }
 }
 
-function Screw({ at }) {
-  const pos = {
-    tl: { top: -8, left: -8 },
-    tr: { top: -8, right: -8 },
-    bl: { bottom: -8, left: -8 },
-    br: { bottom: -8, right: -8 }
-  }[at];
+function Vis({ at }) {
+  const pos = { tl: { top: -8, left: -8 }, tr: { top: -8, right: -8 }, bl: { bottom: -8, left: -8 }, br: { bottom: -8, right: -8 } }[at];
   return <div style={{ ...decor.screw, ...pos }} />;
 }
 
-/* —————————————— Styles —————————————— */
+/* ————— Styles ————— */
 
 const styles = {
   page: {
     minHeight: "100vh",
-    background:
-      "radial-gradient(1600px 700px at 50% -200px, #1a1920, #0b0b10 60%)",
-    display: "grid",
-    placeItems: "center",
-    padding: 24
+    background: "radial-gradient(1600px 700px at 50% -200px, #1a1920, #0b0b10 60%)",
+    display: "grid", placeItems: "center", padding: 24
   },
   shadowWrap: { position: "relative" },
   cabinet: {
-    width: "min(980px, 94vw)",
-    borderRadius: 26,
-    padding: 16,
+    width: "min(980px, 94vw)", borderRadius: 26, padding: 16,
     border: "1px solid rgba(30,20,10,0.6)",
-    boxShadow:
-      "0 28px 80px rgba(0,0,0,0.65), inset 0 0 0 1px rgba(255,255,255,0.03)",
+    boxShadow: "0 28px 80px rgba(0,0,0,0.65), inset 0 0 0 1px rgba(255,255,255,0.03)",
     background:
-      // bois texturé
       "linear-gradient(180deg,#4b3425,#3c2a1f 40%,#34241b 100%), " +
       "repeating-linear-gradient(45deg, rgba(255,255,255,0.05) 0 1px, rgba(0,0,0,0.06) 1px 2px)",
-    position: "relative",
-    overflow: "hidden"
+    position: "relative", overflow: "hidden"
   },
-
-  headerBar: {
-    display: "flex",
-    alignItems: "center",
-    justifyContent: "space-between",
-    marginBottom: 12
-  },
+  headerBar: { display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 12 },
   brandPlate: {
-    background: "linear-gradient(180deg,#2a2b30,#1b1c23)",
-    color: "#e8e3d6",
-    borderRadius: 10,
-    border: "1px solid #2a2c36",
-    padding: "8px 12px",
+    background: "linear-gradient(180deg,#2a2b30,#1b1c23)", color: "#e8e3d6",
+    borderRadius: 10, border: "1px solid #2a2c36", padding: "8px 12px",
     boxShadow: "inset 0 0 18px rgba(0,0,0,0.45)"
   },
   brandText: { fontWeight: 800, letterSpacing: 2, fontSize: 13 },
@@ -531,97 +491,38 @@ const styles = {
   lampsRow: { display: "flex", gap: 14, alignItems: "center" },
 
   glass: {
-    borderRadius: 16,
-    border: "1px solid #2b2e3a",
-    background:
-      "linear-gradient(180deg, rgba(16,18,26,0.95), rgba(10,12,18,0.95)), " +
-      "radial-gradient(800px 200px at 50% -80px, rgba(255,255,255,0.06), transparent 60%)",
-    padding: 12,
-    position: "relative",
-    overflow: "hidden",
-    boxShadow: "inset 0 0 28px rgba(0,0,0,0.5)"
+    borderRadius: 16, border: "1px solid #2b2e3a",
+    background: "linear-gradient(180deg, rgba(16,18,26,0.95), rgba(10,12,18,0.95)), radial-gradient(800px 200px at 50% -80px, rgba(255,255,255,0.06), transparent 60%)",
+    padding: 12, position: "relative", overflow: "hidden", boxShadow: "inset 0 0 28px rgba(0,0,0,0.5)"
   },
-  scaleWrap: {
-    position: "relative",
-    height: 54,
-    borderRadius: 10,
-    border: "1px solid #252834",
-    background: "#0d0f15",
-    overflow: "hidden",
-    marginBottom: 8
-  },
-  scaleGrid: {
-    position: "absolute",
-    inset: 0,
-    background:
-      "repeating-linear-gradient(90deg, rgba(255,255,255,0.08) 0 2px, transparent 2px 12px)"
-  },
-  tick: {
-    position: "absolute", top: 0, width: 2, height: "100%",
-    background: "rgba(240,210,140,0.7)", transform: "translateX(-1px)"
-  },
-  needle: {
-    position: "absolute", top: 0, width: 2, height: "100%",
-    background: "#f05a6e",
-    boxShadow: "0 0 10px rgba(240,90,110,0.7), 0 0 20px rgba(240,90,110,0.35)",
-    transform: "translateX(-1px)"
-  },
-  stationRow: {
-    display: "flex", justifyContent: "space-between",
-    color: "#eae7f5", fontSize: 13, padding: "0 2px"
-  },
-  scratches: {
-    position: "absolute", inset: 0, pointerEvents: "none",
-    background:
-      "linear-gradient(transparent, rgba(255,255,255,0.03) 20%, transparent 60%), " +
-      "repeating-linear-gradient(120deg, rgba(255,255,255,0.03) 0 1px, transparent 1px 4px)"
+  scaleWrap: { position: "relative", height: 54, borderRadius: 10, border: "1px solid #252834", background: "#0d0f15", overflow: "hidden", marginBottom: 8 },
+  scaleGrid: { position: "absolute", inset: 0, background: "repeating-linear-gradient(90deg, rgba(255,255,255,0.08) 0 2px, transparent 2px 12px)" },
+  tick: { position: "absolute", top: 0, width: 2, height: "100%", background: "rgba(240,210,140,0.7)", transform: "translateX(-1px)" },
+  needle: { position: "absolute", top: 0, width: 2, height: "100%", background: "#f05a6e", boxShadow: "0 0 10px rgba(240,90,110,0.7), 0 0 20px rgba(240,90,110,0.35)", transform: "translateX(-1px)" },
+  stationRow: { display: "flex", justifyContent: "space-between", color: "#eae7f5", fontSize: 13, padding: "0 2px" },
+  scratches: { position: "absolute", inset: 0, pointerEvents: "none", background: "linear-gradient(transparent, rgba(255,255,255,0.03) 20%, transparent 60%), repeating-linear-gradient(120deg, rgba(255,255,255,0.03) 0 1px, transparent 1px 4px)" },
+
+  compatBanner: {
+    position: "absolute", right: 10, bottom: 10,
+    background: "rgba(240,180,60,0.18)", border: "1px solid rgba(240,180,60,0.35)",
+    color: "#f0c572", padding: "6px 10px", borderRadius: 8, fontSize: 12
   },
 
-  speakerSection: {
-    marginTop: 12,
-    display: "grid",
-    gridTemplateColumns: "2fr 1fr",
-    gap: 12
-  },
+  speakerSection: { marginTop: 12, display: "grid", gridTemplateColumns: "2fr 1fr", gap: 12 },
   grill: {
-    borderRadius: 14,
-    border: "1px solid #282a32",
-    height: 120,
-    background:
-      "radial-gradient(circle at 30% 30%, rgba(0,0,0,0.3), transparent 65%), " +
-      "repeating-linear-gradient(45deg, #1a1d27 0 6px, #131521 6px 12px)"
+    borderRadius: 14, border: "1px solid #282a32", height: 120,
+    background: "radial-gradient(circle at 30% 30%, rgba(0,0,0,0.3), transparent 65%), repeating-linear-gradient(45deg, #1a1d27 0 6px, #131521 6px 12px)"
   },
   vuWrap: {
-    borderRadius: 14,
-    border: "1px solid #282a32",
-    height: 120,
-    padding: 12,
-    background:
-      "linear-gradient(180deg,#12141c,#0e1017)",
-    display: "grid",
-    gridTemplateRows: "1fr 1fr",
-    gap: 10
+    borderRadius: 14, border: "1px solid #282a32", height: 120, padding: 12,
+    background: "linear-gradient(180deg,#12141c,#0e1017)",
+    display: "grid", gridTemplateRows: "1fr 1fr", gap: 10
   },
 
-  controlsRow: {
-    marginTop: 14,
-    display: "grid",
-    gridTemplateColumns: "1.05fr 1fr 1.05fr",
-    gap: 14
-  },
-  colLeft: {
-    display: "grid", gridTemplateRows: "auto auto auto auto", gap: 10, alignContent: "start"
-  },
-  colCenter: {
-    display: "grid",
-    gridTemplateColumns: "1fr 1fr",
-    gap: 14,
-    alignItems: "center",
-    justifyItems: "center"
-  },
-  colRight: {
-    display: "grid", gridTemplateRows: "auto auto", gap: 10, justifyItems: "center", alignContent: "start"
-  },
+  controlsRow: { marginTop: 14, display: "grid", gridTemplateColumns: "1.05fr 1fr 1.05fr", gap: 14 },
+  colLeft: { display: "grid", gridTemplateRows: "auto auto auto auto", gap: 10, alignContent: "start" },
+  colCenter: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14, alignItems: "center", justifyItems: "center" },
+  colRight: { display: "grid", gridTemplateRows: "auto auto", gap: 10, justifyItems: "center", alignContent: "start" },
   subDials: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, alignItems: "center" }
 };
 
@@ -632,14 +533,9 @@ const ui = {
     background: "radial-gradient(circle at 30% 30%, #4d505a, #2a2f3a 60%, #141821 100%)",
     border: "1px solid #1e2430",
     boxShadow: "inset 0 10px 26px rgba(0,0,0,0.6), 0 8px 24px rgba(0,0,0,0.45)",
-    display: "grid", placeItems: "center",
-    touchAction: "none", userSelect: "none", cursor: "grab",
-    transition: "transform .05s linear"
+    display: "grid", placeItems: "center", touchAction: "none", userSelect: "none", cursor: "grab", transition: "transform .05s linear"
   },
-  knobIndicator: {
-    width: 6, height: 26, borderRadius: 3, background: "#f6d8a8",
-    boxShadow: "0 0 8px rgba(246,216,168,0.4)"
-  },
+  knobIndicator: { width: 6, height: 26, borderRadius: 3, background: "#f6d8a8", boxShadow: "0 0 8px rgba(246,216,168,0.4)" },
   knobLabel: { color: "#f0e7d1", marginTop: 6, fontSize: 12, letterSpacing: 1.2 },
   hint: { color: "rgba(255,255,255,0.65)", fontSize: 11, marginTop: 2 },
 
@@ -649,29 +545,16 @@ const ui = {
     background: "radial-gradient(circle at 30% 30%, #5a5e68, #2a2f3a 60%, #141821 100%)",
     border: "1px solid #1e2430",
     boxShadow: "inset 0 12px 30px rgba(0,0,0,0.62), 0 10px 28px rgba(0,0,0,0.5)",
-    display: "grid", placeItems: "center",
-    touchAction: "none", userSelect: "none", cursor: "grab"
+    display: "grid", placeItems: "center", touchAction: "none", userSelect: "none", cursor: "grab"
   },
-  bigKnobIndicator: {
-    width: 8, height: 34, borderRadius: 4, background: "#ffd28c",
-    boxShadow: "0 0 12px rgba(255,210,140,0.55)"
-  },
+  bigKnobIndicator: { width: 8, height: 34, borderRadius: 4, background: "#ffd28c", boxShadow: "0 0 12px rgba(255,210,140,0.55)" },
 
   switchBlock: { display: "grid", gridTemplateColumns: "auto 1fr", alignItems: "center", gap: 10 },
   switchLabel: { color: "#f0e7d1", fontSize: 12, letterSpacing: 1.2 },
   switch: { width: 44, height: 20, borderRadius: 12, position: "relative", border: "1px solid #2b2b36" },
   switchDot: { width: 18, height: 18, borderRadius: "50%", background: "#0b0b10", border: "1px solid #2b2b36", position: "absolute", top: 1, left: 1, transition: "transform .15s" },
 
-  button: {
-    cursor: "pointer",
-    border: "1px solid #2b2b36",
-    borderRadius: 12,
-    padding: "10px 14px",
-    fontWeight: 800,
-    fontSize: 13,
-    color: "#0b0b10",
-    boxShadow: "0 6px 18px rgba(0,0,0,0.35)"
-  },
+  button: { cursor: "pointer", border: "1px solid #2b2b36", borderRadius: 12, padding: "10px 14px", fontWeight: 800, fontSize: 13, color: "#0b0b10", boxShadow: "0 6px 18px rgba(0,0,0,0.35)" },
 
   lamp: { display: "grid", gridTemplateColumns: "auto auto", gap: 6, alignItems: "center" },
   lampDot: { width: 12, height: 12, borderRadius: "50%" },
@@ -683,38 +566,16 @@ const ui = {
 };
 
 const vu = {
-  box: {
-    background: "linear-gradient(180deg,#171923,#0f121a)",
-    border: "1px solid #262a36",
-    borderRadius: 10,
-    padding: 8,
-    boxShadow: "inset 0 0 22px rgba(0,0,0,0.5)",
-    display: "grid",
-    gridTemplateRows: "1fr auto",
-    gap: 6
-  },
-  scale: {
-    height: 12,
-    borderRadius: 8,
-    background: "linear-gradient(180deg,#0b0e15,#0a0c12)",
-    border: "1px solid #242837",
-    overflow: "hidden",
-    position: "relative"
-  },
-  bar: {
-    position: "absolute", top: 0, left: 0, bottom: 0,
-    background: "#7bdc8b", transition: "width 60ms linear"
-  },
+  box: { background: "linear-gradient(180deg,#171923,#0f121a)", border: "1px solid #262a36", borderRadius: 10, padding: 8, boxShadow: "inset 0 0 22px rgba(0,0,0,0.5)", display: "grid", gridTemplateRows: "1fr auto", gap: 6 },
+  scale: { height: 12, borderRadius: 8, background: "linear-gradient(180deg,#0b0e15,#0a0c12)", border: "1px solid #242837", overflow: "hidden", position: "relative" },
+  bar: { position: "absolute", top: 0, left: 0, bottom: 0, background: "#7bdc8b", transition: "width 60ms linear" },
   label: { color: "#cfc8b0", fontSize: 10, textAlign: "right", opacity: 0.85 }
 };
 
 const decor = {
   screw: {
-    position: "absolute",
-    width: 18, height: 18,
-    borderRadius: "50%",
-    background:
-      "radial-gradient(circle at 30% 30%, #9aa0ad, #4b515e 60%, #1e232d)",
+    position: "absolute", width: 18, height: 18, borderRadius: "50%",
+    background: "radial-gradient(circle at 30% 30%, #9aa0ad, #4b515e 60%, #1e232d)",
     border: "1px solid #222834",
     boxShadow: "0 8px 20px rgba(0,0,0,0.5), inset 0 3px 8px rgba(0,0,0,0.6)"
   }
