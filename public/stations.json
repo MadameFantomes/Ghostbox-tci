@@ -1,6 +1,5 @@
 {
   "France (Radio France)": [
-
     { "name": "France Inter", "url": "https://icecast.radiofrance.fr/franceinter-midfi.mp3" },
     { "name": "France Culture", "url": "https://direct.franceculture.fr/live/franceculture-midfi.mp3" },
     { "name": "France Musique", "url": "https://direct.francemusique.fr/live/francemusique-midfi.mp3" },
