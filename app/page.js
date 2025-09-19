@@ -1,18 +1,18 @@
 "use client";
 
 /**
- * Ghostbox TCI — Simple FR (fix: charge /stations.json, “Suivante” robuste, auto-skip)
- * - Lit /public/stations.json si présent (tableau [{name,url}] OU groupes {"France":[...]} avec url OU urls[]).
- * - Déplie urls[], filtre HTTPS, déduplique, mélange pour varier.
- * - Bouton "SUIVANTE" et balayage AUTO utilisent playIndex() qui saute automatiquement
- *   les flux qui ne jouent pas et avance l’index de façon fiable.
- * - Contrôles: MARCHE, BALAYAGE AUTO, VITESSE, VOLUME, ÉCHO, DÉBIT (bruit inter-station).
- * - Fond: /radio-vintage.svg.
+ * Ghostbox TCI — FR minimal
+ * Fixes:
+ *  - MARCHE = arrêt total (stop timer + pause <audio> + coupe bruit + suspend AudioContext)
+ *  - ENREGISTRER (MediaRecorder .webm) — remplace "SUIVANTE"
+ *  - Bruit de balayage + fond audible (DÉBIT contrôle durée/intensité)
+ *  - Lecture robuste (auto-skip des flux HS avec timeout)
+ *  - Charge /public/stations.json (HTTPS), sinon fallback 7 stations
  */
 
 import React, { useEffect, useRef, useState } from "react";
 
-/* ——— Fallback minimal si /stations.json absent ——— */
+/* ------- Fallback si /stations.json absent ------- */
 const FALLBACK_STATIONS = [
   "https://icecast.radiofrance.fr/fip-midfi.mp3",
   "https://icecast.radiofrance.fr/fiprock-midfi.mp3",
@@ -26,14 +26,17 @@ const FALLBACK_STATIONS = [
 export default function Page() {
   const audioElRef = useRef(null);
 
-  // Audio
+  // Audio graph
   const ctxRef = useRef(null);
   const masterRef = useRef(null);
   const destRef = useRef(null);
+
   const mediaSrcRef = useRef(null);
   const radioGainRef = useRef(null);
+
   const noiseNodeRef = useRef(null);
   const noiseGainRef = useRef(null);
+
   const dryRef = useRef(null);
   const echoDelayRef = useRef(null);
   const echoFbRef = useRef(null);
@@ -43,33 +46,39 @@ export default function Page() {
   const [stations, setStations] = useState(FALLBACK_STATIONS);
   const stationsRef = useRef(FALLBACK_STATIONS);
 
-  // Index courant (state + ref pour les timers)
+  // Index courant (state + ref pour timers)
   const [idx, setIdx] = useState(0);
   const idxRef = useRef(0);
 
-  // UI / état
+  // État UI
   const [etat, setEtat] = useState("prêt");
   const [marche, setMarche] = useState(false);
   const [auto, setAuto] = useState(false);
   const [compat, setCompat] = useState(false);
-  const [sourceInfo, setSourceInfo] = useState(""); // badge “N stations …”
+  const [sourceInfo, setSourceInfo] = useState("");
   const sweepTimerRef = useRef(null);
-  const playingLockRef = useRef(false); // évite les lectures concurrentes
+  const playingLockRef = useRef(false);
 
-  // 4 contrôles
-  const [vitesse, setVitesse] = useState(0.45); // 0..1 → 250..2500ms
+  // 4 réglages
+  const [vitesse, setVitesse] = useState(0.45); // 250..2500 ms
   const [volume, setVolume]   = useState(0.9);  // master
-  const [echo, setEcho]       = useState(0.3);  // mix + fb doux
-  const [debit, setDebit]     = useState(0.5);  // durée/intensité bruit blanc
+  const [echo, setEcho]       = useState(0.3);  // mix + fb
+  const [debit, setDebit]     = useState(0.7);  // intensité & durée bruit (par défaut plus fort)
+
+  // Enregistrement
+  const [enr, setEnr] = useState(false);
+  const recRef = useRef(null);
+  const chunksRef = useRef([]);
 
   // Helpers
   const clamp01 = (x) => Math.max(0, Math.min(1, x));
-  const msFromSpeed = (v) => Math.round(250 + v * (2500 - 250));  // 250..2500 ms
-  const burstMs = () => Math.round(40 + debit * 420);             // 40..460 ms
-  const burstGain = () => 0.15 + debit * 0.85;                    // 0.15..1
+  const msFromSpeed = (v) => Math.round(250 + v * (2500 - 250));  // 250..2500
+  const BASE_NOISE = 0.035;                                       // léger bruit de fond
+  const burstMs = () => Math.round(120 + debit * 520);            // 120..640 ms de bruit
+  const burstGain = () => 0.25 + debit * 0.9;                     // 0.25..1.15 (sera clampé)
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-  /* ——— Charger /stations.json si présent ——— */
+  /* ------- Charger /stations.json si présent ------- */
   useEffect(() => {
     (async () => {
       try {
@@ -81,7 +90,7 @@ export default function Page() {
           setStations(flat);
           stationsRef.current = flat;
           idxRef.current = 0; setIdx(0);
-          setSourceInfo(`${flat.length} stations (depuis stations.json)`);
+          setSourceInfo(`${flat.length} stations (stations.json)`);
           return;
         }
         setSourceInfo(`${FALLBACK_STATIONS.length} stations (fallback)`);
@@ -98,13 +107,11 @@ export default function Page() {
       if (!url || typeof url !== "string") return;
       if (!/^https:/i.test(url)) return; // HTTPS only
       try {
-        // nettoie les espaces/quotes parasites
         url = url.trim();
         const nm = (name && name.trim()) || new URL(url).host + suffix;
         list.push({ name: nm, url });
-      } catch { /* URL invalide */ }
+      } catch {}
     };
-
     if (Array.isArray(json)) {
       json.forEach((s) => {
         if (!s) return;
@@ -121,43 +128,43 @@ export default function Page() {
         });
       });
     }
-
-    // dédup par URL
+    // dédup + mélange
     const seen = new Set();
     list = list.filter((s) => (seen.has(s.url) ? false : seen.add(s.url)));
-
-    // mélange pour varier le balayage
-    for (let i = list.length - 1; i > 0; i--) {
-      const j = Math.floor(Math.random() * (i + 1));
-      [list[i], list[j]] = [list[j], list[i]];
-    }
+    for (let i = list.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [list[i], list[j]] = [list[j], list[i]]; }
     return list;
   }
 
-  /* ——— Init WebAudio ——— */
+  /* ------- Init WebAudio ------- */
   async function initAudio() {
     if (ctxRef.current) return;
     const ctx = new (window.AudioContext || window.webkitAudioContext)();
     ctxRef.current = ctx;
 
-    const master = ctx.createGain(); master.gain.value = volume; master.connect(ctx.destination);
+    const master = ctx.createGain(); master.gain.value = clamp01(volume); master.connect(ctx.destination);
     masterRef.current = master;
+
+    // enregistrement
     const dest = ctx.createMediaStreamDestination(); master.connect(dest);
     destRef.current = dest;
 
+    // radio
     const gRadio = ctx.createGain(); gRadio.gain.value = 1; radioGainRef.current = gRadio;
 
+    // bruit
     const gNoise = ctx.createGain(); gNoise.gain.value = 0; noiseGainRef.current = gNoise;
     const noise = createNoiseNode(ctx); noiseNodeRef.current = noise; try { noise.start(0); } catch {}
 
+    // dry & echo
     const dry = ctx.createGain(); dry.gain.value = 1; dryRef.current = dry;
 
-    const dly = ctx.createDelay(1.2); dly.delayTime.value = 0.32;
+    const dly = ctx.createDelay(1.2); dly.delayTime.value = 0.34;
     const fb  = ctx.createGain(); fb.gain.value = 0.25;
     dly.connect(fb); fb.connect(dly);
     const wet = ctx.createGain(); wet.gain.value = 0;
     echoDelayRef.current = dly; echoFbRef.current = fb; echoWetRef.current = wet;
 
+    // sommation
     const sum = ctx.createGain(); sum.gain.value = 1;
     gRadio.connect(sum); gNoise.connect(sum);
     sum.connect(dry);  dry.connect(master);
@@ -185,88 +192,92 @@ export default function Page() {
     }
   }
 
-  /* ——— Power ——— */
+  /* ------- Power ------- */
   async function powerOn() {
     await initAudio();
     const ctx = ctxRef.current;
     if (ctx.state === "suspended") await ctx.resume();
-    await playIndex(idxRef.current); // joue la station courante avec auto-skip si HS
+
+    // met un léger bruit de fond
+    try { noiseGainRef.current.gain.value = BASE_NOISE; } catch {}
+
+    await playIndex(idxRef.current);
     setMarche(true);
   }
-  function powerOff() {
+
+  async function powerOff() {
+    // stop balayage + lecture + bruit
     stopSweep();
-    if (audioElRef.current) {
-      audioElRef.current.pause();
-      audioElRef.current.src = "";
-      audioElRef.current.load();
-    }
+    const el = audioElRef.current;
+    try { noiseGainRef.current.gain.value = 0; } catch {}
+    if (el) { el.pause(); el.src = ""; el.load(); }
+    // stop record si actif
+    if (enr) { try { recRef.current?.stop(); } catch {} setEnr(false); }
+    // suspend l’audio (silence total)
+    try { await ctxRef.current?.suspend(); } catch {}
     setMarche(false);
+    setAuto(false);
     setEtat("arrêté");
+    playingLockRef.current = false;
   }
 
-  /* ——— Lecture robuste d’un index (avec auto-skip des flux HS) ——— */
+  /* ------- Lecture robuste d’un index (burst bruit + timeout + auto-skip) ------- */
   async function playIndex(startIndex, tries = 0) {
     const list = stationsRef.current;
     if (!list.length) return;
-    if (tries >= list.length) {
-      setEtat("aucun flux lisible");
-      return;
-    }
-    if (playingLockRef.current) return; // on ignore si déjà en cours
+    if (tries >= list.length) { setEtat("aucun flux lisible"); return; }
+    if (playingLockRef.current) return;
     playingLockRef.current = true;
 
     const el = audioElRef.current;
     const entry = list[startIndex];
     const url = typeof entry === "string" ? entry : entry.url;
 
-    // Burst de bruit (balayage)
     const ctx = ctxRef.current;
     const now = ctx.currentTime;
-    const burstDur = burstMs() / 1000;
+    const dur = burstMs() / 1000;
+    const targetNoise = Math.min(1.15, burstGain());
 
+    // burst de bruit + mute de la radio
     try {
       if (!compat) {
         radioGainRef.current.gain.cancelScheduledValues(now);
-        radioGainRef.current.gain.linearRampToValueAtTime(0.0001, now + 0.06);
+        radioGainRef.current.gain.linearRampToValueAtTime(0.0001, now + 0.05);
       } else {
-        el.volume = 0; // mute <audio> en compat pendant le bruit
+        el.volume = 0;
       }
       noiseGainRef.current.gain.cancelScheduledValues(now);
-      noiseGainRef.current.gain.setTargetAtTime(burstGain(), now, 0.04);
+      noiseGainRef.current.gain.setTargetAtTime(targetNoise, now, 0.04);
     } catch {}
-
     setEtat("balayage…");
-    await sleep(Math.max(60, burstMs() * 0.45));
+    await sleep(Math.max(80, dur * 500)); // attente ~ moitié du burst
 
-    // Tentative de lecture
+    // jouer la station
     try {
       el.crossOrigin = "anonymous";
       el.pause(); el.src = url; el.load();
 
-      // Timeout de lecture (3 s) pour éviter de rester bloqué
-      const playPromise = el.play();
-      const timeout = new Promise((_, rej) => setTimeout(() => rej(new Error("timeout")), 3000));
-      await Promise.race([playPromise, timeout]);
+      // lecture avec timeout 3.5s
+      const playP = el.play();
+      const timeout = new Promise((_, rej) => setTimeout(() => rej(new Error("timeout")), 3500));
+      await Promise.race([playP, timeout]);
 
-      // Brancher WebAudio si possible
+      // brancher WebAudio si possible
       await attachMedia();
 
-      // Fondu retour: on remonte la radio, on coupe le bruit
-      const after = ctx.currentTime + Math.max(0.08, burstDur * 0.6);
-      if (!compat) {
-        try { radioGainRef.current.gain.setTargetAtTime(1, after, 0.08); } catch {}
-      } else {
-        el.volume = clamp01(volume);
-      }
-      try { noiseGainRef.current.gain.setTargetAtTime(0.0001, after, 0.1); } catch {}
+      // fondu retour: coupe le burst, remet un bruit de fond léger
+      const after = ctx.currentTime + Math.max(0.08, dur * 0.6);
+      try {
+        noiseGainRef.current.gain.setTargetAtTime(BASE_NOISE, after, 0.12);
+        if (!compat) radioGainRef.current.gain.setTargetAtTime(1, after, 0.08);
+        else el.volume = clamp01(volume);
+      } catch {}
 
-      // Mise à jour index/état (succès)
       idxRef.current = startIndex; setIdx(startIndex);
-      const name = entry?.name || (entry?.url ? new URL(entry.url).host : "");
-      setEtat(compat ? `lecture (compatibilité)` : `lecture`);
+      setEtat(compat ? "lecture (compatibilité)" : "lecture");
     } catch (e) {
-      // Échec → on passe à la suivante
-      try { noiseGainRef.current.gain.setTargetAtTime(0.0001, ctx.currentTime + 0.05, 0.08); } catch {}
+      // échec → coupe le bruit, passe à la suivante
+      try { noiseGainRef.current.gain.setTargetAtTime(BASE_NOISE, ctx.currentTime + 0.05, 0.12); } catch {}
       const next = (startIndex + 1) % list.length;
       playingLockRef.current = false;
       await playIndex(next, tries + 1);
@@ -276,13 +287,12 @@ export default function Page() {
     playingLockRef.current = false;
   }
 
-  /* ——— Balayage AUTO ——— */
+  /* ------- Balayage auto ------- */
   function startSweep() {
     stopSweep();
     const tick = async () => {
       if (!marche) return;
-      const list = stationsRef.current;
-      if (!list.length) return;
+      const list = stationsRef.current; if (!list.length) return;
       const next = (idxRef.current + 1) % list.length;
       await playIndex(next);
       sweepTimerRef.current = setTimeout(tick, msFromSpeed(vitesse));
@@ -294,7 +304,30 @@ export default function Page() {
     sweepTimerRef.current = null;
   }
 
-  /* ——— Réactions contrôles ——— */
+  /* ------- Enregistrement ------- */
+  function toggleEnr() {
+    if (!destRef.current) return;
+    if (!enr) {
+      const rec = new MediaRecorder(destRef.current.stream, { mimeType: "audio/webm;codecs=opus" });
+      chunksRef.current = [];
+      rec.ondataavailable = (e) => { if (e.data.size) chunksRef.current.push(e.data); };
+      rec.onstop = () => {
+        const blob = new Blob(chunksRef.current, { type: "audio/webm" });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url; a.download = `ghostbox-${new Date().toISOString().replace(/[:.]/g,"-")}.webm`;
+        document.body.appendChild(a); a.click();
+        setTimeout(()=>{ document.body.removeChild(a); URL.revokeObjectURL(url); },0);
+      };
+      rec.start();
+      recRef.current = rec; setEnr(true);
+    } else {
+      try { recRef.current?.stop(); } catch {}
+      setEnr(false);
+    }
+  }
+
+  /* ------- Réactions contrôles ------- */
   useEffect(() => {
     if (masterRef.current) masterRef.current.gain.value = clamp01(volume);
     if (audioElRef.current && compat) audioElRef.current.volume = clamp01(volume);
@@ -312,7 +345,7 @@ export default function Page() {
     return stopSweep;
   }, [auto, vitesse, marche]);
 
-  /* ——— UI ——— */
+  /* ------- UI ------- */
   const list = stationsRef.current;
   const current = list[idxRef.current];
   const currentName = current?.name || (current?.url ? new URL(current.url).host : "");
@@ -321,7 +354,7 @@ export default function Page() {
     <main style={styles.page}>
       <div style={styles.shadowWrap}>
         <div style={styles.cabinet}>
-          {/* Titre + badge nombre de stations */}
+          {/* Titre + badges */}
           <div style={styles.headerBar}>
             <div style={styles.brandPlate}>
               <div style={styles.brandText}>MADAME FANTÔMES</div>
@@ -332,6 +365,7 @@ export default function Page() {
               <div style={styles.lampsRow}>
                 <Lamp label="MARCHE" on={marche} />
                 <Lamp label="AUTO" on={auto} colorOn="#86fb6a" />
+                <Lamp label="ENR" on={enr} colorOn="#ff5656" />
               </div>
             </div>
           </div>
@@ -350,19 +384,16 @@ export default function Page() {
           {/* Contrôles */}
           <div style={styles.controlsRow}>
             <div style={styles.switches}>
-              <Switch label="MARCHE" on={marche} onChange={async v => { setMarche(v); v ? await powerOn() : powerOff(); }} />
+              <Switch label="MARCHE" on={marche} onChange={async v => { setMarche(v); v ? await powerOn() : await powerOff(); }} />
               <Switch label="BALAYAGE AUTO" on={auto} onChange={(v) => setAuto(v)} />
-              <Bouton label="SUIVANTE" onClick={async () => {
-                const n = (idxRef.current + 1) % list.length;
-                await playIndex(n);
-              }} />
+              <Bouton label={enr ? "STOP ENREG." : "ENREGISTRER"} onClick={toggleEnr} color={enr ? "#f0c14b" : "#d94242"} />
             </div>
 
             <div style={styles.knobs}>
               <Knob label="VITESSE" value={vitesse} onChange={(v) => setVitesse(clamp01(v))} hint={`${msFromSpeed(vitesse)} ms`} />
               <Knob label="VOLUME"  value={volume}  onChange={(v) => setVolume(clamp01(v))} />
               <Knob label="ÉCHO"    value={echo}    onChange={(v) => setEcho(clamp01(v))} />
-              <Knob label="DÉBIT"   value={debit}   onChange={(v) => setDebit(clamp01(v))} hint={`${burstMs()} ms bruit`} />
+              <Knob label="DÉBIT"   value={debit}   onChange={(v) => setDebit(clamp01(v))} hint={`${burstMs()} ms de bruit`} />
             </div>
           </div>
 
@@ -373,13 +404,13 @@ export default function Page() {
       </div>
 
       <p style={{ color: "rgba(255,255,255,0.7)", marginTop: 10, fontSize: 12 }}>
-        Vérifie que <code>/stations.json</code> s’ouvre bien dans le navigateur. Le badge doit afficher le bon total (pas 7).
+        Tip : pour bien entendre le <em>balayage</em>, mets <strong>DÉBIT ≥ 0.6</strong> et active <strong>AUTO</strong>. MARCHE coupe tout instantanément.
       </p>
     </main>
   );
 }
 
-/* ——— UI widgets ——— */
+/* ------- UI widgets ------- */
 
 function Knob({ label, value, onChange, hint }) {
   const [drag, setDrag] = useState(null);
@@ -429,7 +460,7 @@ function Vis({ at }) {
   return <div style={{ ...decor.screw, ...pos }} />;
 }
 
-/* ——— Styles ——— */
+/* ------- Styles ------- */
 
 const styles = {
   page: {
