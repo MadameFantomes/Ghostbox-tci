@@ -1,27 +1,56 @@
 "use client";
 
 /**
- * Ghostbox TCI — Radio Vintage (FR)
- * - Radio live (HTTPS)
- * - Mode normal (WebAudio complet) + Mode compatibilité (si CORS bloque)
+ * Ghostbox TCI — Radio Vintage (FR) + compat CORS + image SVG de fond
+ * - Stations avec plusieurs URLs (fallback)
+ * - Mode compatibilité si CORS bloque WebAudio (la radio joue quand même)
  * - Contrôles FR : MARCHE, RÉGLAGE, VOLUME, BRUIT, FILTRE, BALAYAGE AUTO, VITESSE, ENREGISTRER
  * - VU-mètres, enregistrement .webm
+ * - Le cabinet affiche /radio-vintage.svg en background
  */
 
 import React, { useEffect, useRef, useState } from "react";
 
-// —————————————————— Stations conseillées (MP3 d'abord) ——————————————————
+/* ————— Stations (MP3/AAC fiables) ————— */
 const STATIONS = [
-  { name: "Référence MP3 (RadioMast)", url: "https://streams.radiomast.io/reference-mp3" }, // MP3: bon pour tests
-  { name: "Référence AAC (RadioMast)", url: "https://streams.radiomast.io/reference-aac" },  // AAC: selon navigateur
-  { name: "Swiss Jazz 96k (AAC)",      url: "https://stream.srg-ssr.ch/srgssr/rsj/aac/96" },
-  { name: "Swiss Classic 96k (AAC)",   url: "https://stream.srg-ssr.ch/srgssr/rsc/aac/96" }
+  {
+    name: "FIP (Radio France)",
+    urls: [
+      "https://icecast.radiofrance.fr/fip-midfi.mp3?id=radiofrance",
+      "https://icecast.radiofrance.fr/fip-hifi.aac?id=radiofrance"
+    ]
+  },
+  {
+    name: "FIP Groove",
+    urls: [
+      "https://icecast.radiofrance.fr/fipgroove-midfi.mp3?id=radiofrance",
+      "https://icecast.radiofrance.fr/fipgroove-hifi.aac?id=radiofrance"
+    ]
+  },
+  {
+    name: "Radio Swiss Jazz",
+    urls: [
+      "https://stream.srg-ssr.ch/srgssr/rsj/aac/96"
+    ]
+  },
+  {
+    name: "Radio Swiss Classic",
+    urls: [
+      "https://stream.srg-ssr.ch/srgssr/rsc/aac/96"
+    ]
+  },
+  {
+    name: "Référence MP3 (RadioMast)",
+    urls: [
+      "https://streams.radiomast.io/reference-mp3"
+    ]
+  }
 ];
 
 export default function Page() {
   const audioElRef = useRef(null);
 
-  // WebAudio graph
+  // WebAudio
   const ctxRef = useRef(null);
   const destRef = useRef(null);
   const masterGainRef = useRef(null);
@@ -32,25 +61,25 @@ export default function Page() {
   const bandpassRef = useRef(null);
   const analyserRef = useRef(null);
 
-  // UI
+  // UI state
   const [marche, setMarche] = useState(false);
   const [stationIndex, setStationIndex] = useState(0);
   const [etat, setEtat] = useState("prêt");
 
-  const [volume, setVolume] = useState(0.9);   // niveau radio
-  const [bruit, setBruit]   = useState(0.25);  // bruit blanc
+  const [volume, setVolume] = useState(0.9); // radio
+  const [bruit, setBruit]   = useState(0.25); // bruit blanc
   const [filtre, setFiltre] = useState(true);
-  const [q, setQ]     = useState(1.2);
+  const [q, setQ] = useState(1.2);
   const [fMin, setFMin] = useState(280);
 
   const [autoSweep, setAutoSweep] = useState(false);
-  const [vitesse, setVitesse] = useState(0.45); // 0..1  → 300..2000ms
+  const [vitesse, setVitesse] = useState(0.45); // 0..1 → 300..2000ms
   const sweepTimerRef = useRef(null);
 
-  // Mode compatibilité (CORS)
+  // compat CORS
   const [compat, setCompat] = useState(false);
 
-  // Record
+  // Enregistrement
   const [enr, setEnr] = useState(false);
   const recRef = useRef(null);
   const chunksRef = useRef([]);
@@ -59,10 +88,11 @@ export default function Page() {
   const [vuG, setVuG] = useState(0);
   const [vuD, setVuD] = useState(0);
 
+  // helpers
   const clamp01 = (x) => Math.max(0, Math.min(1, x));
-  const msFromSpeed = (v) => Math.round(300 + v * (2000 - 300)); // 300ms → 2000ms
+  const msFromSpeed = (v) => Math.round(300 + v * (2000 - 300)); // 300→2000ms
 
-  // ——— Init
+  /* ————— Init ————— */
   async function initAudio() {
     if (ctxRef.current) return;
     const ctx = new (window.AudioContext || window.webkitAudioContext)();
@@ -88,11 +118,10 @@ export default function Page() {
 
     const noise = createNoiseNode(ctx); noiseNodeRef.current = noise;
 
-    const analyser = ctx.createAnalyser();
-    analyser.fftSize = 512;
+    const analyser = ctx.createAnalyser(); analyser.fftSize = 512;
     analyserRef.current = analyser;
 
-    rechain(filtre, /*compat*/ false);
+    rechain(filtre, /*compatMode*/ false);
     master.connect(analyser);
     startVuLoop();
   }
@@ -101,8 +130,9 @@ export default function Page() {
     try { radioGainRef.current?.disconnect(); } catch {}
     try { noiseGainRef.current?.disconnect(); } catch {}
     try { bandpassRef.current?.disconnect(); } catch {}
+
     if (compatMode) {
-      // en compat: seule la chaîne BRUIT passe par WebAudio (la radio lit directement)
+      // en compat : seule la voie BRUIT est dans WebAudio (radio non filtrée)
       noiseGainRef.current.connect(masterGainRef.current);
       return;
     }
@@ -117,7 +147,7 @@ export default function Page() {
   }
 
   function createNoiseNode(ctx) {
-    const size = 2 * ctx.sampleRate; // 2s
+    const size = 2 * ctx.sampleRate;
     const buf = ctx.createBuffer(1, size, ctx.sampleRate);
     const data = buf.getChannelData(0);
     for (let i = 0; i < size; i++) data[i] = (Math.random() * 2 - 1) * 0.9;
@@ -126,31 +156,13 @@ export default function Page() {
     return src;
   }
 
-  async function attachMedia() {
-    // essaie de brancher la radio au graphe WebAudio
-    if (!ctxRef.current || !audioElRef.current) return;
-    if (mediaSrcRef.current) {
-      try { mediaSrcRef.current.disconnect(); } catch {}
-      mediaSrcRef.current = null;
-    }
-    try {
-      const src = ctxRef.current.createMediaElementSource(audioElRef.current);
-      mediaSrcRef.current = src;
-      src.connect(radioGainRef.current);
-      setCompat(false); // succès : effet complet dispo
-    } catch {
-      // échec : CORS → compat
-      setCompat(true);
-    }
-  }
-
-  // ——— MARCHE
+  /* ————— Power ————— */
   async function marcheOn() {
     await initAudio();
     const ctx = ctxRef.current;
     if (ctx.state === "suspended") await ctx.resume();
     try { noiseNodeRef.current.start(0); } catch {}
-    await attachMedia();
+    // ⚠️ on lit d’abord la station, puis on tente de brancher WebAudio
     await tuneTo(stationIndex);
     setMarche(true);
   }
@@ -165,31 +177,56 @@ export default function Page() {
     setEtat("arrêté");
   }
 
-  // ——— Tuning
+  /* ————— Tuning ————— */
   async function tuneTo(index) {
     const el = audioElRef.current;
     if (!el) return;
-    const { url } = STATIONS[index];
 
+    const { urls } = STATIONS[index];
     // petit fondu “scan”
     smooth(noiseGainRef.current.gain, Math.max(bruit, 0.28), 0.12);
     if (!compat) smooth(radioGainRef.current.gain, Math.max(0.12, volume * 0.25), 0.12);
 
-    el.crossOrigin = "anonymous"; // important avant src
-    el.src = url;
     setEtat("connexion…");
-    try {
-      // en mode compat, on contrôle le volume de la balise <audio>
-      el.volume = compat ? clamp01(volume) : 1.0;
+    el.crossOrigin = "anonymous";
 
-      await el.play();
-      setEtat(compat ? "lecture (compatibilité)" : "lecture");
-      if (!compat) {
-        smooth(radioGainRef.current.gain, volume, 0.28);
+    // essaie plusieurs URLs
+    let ok = false, lastErr = null;
+    for (const url of urls) {
+      try {
+        el.pause();
+        el.src = url;
+        el.load();
+        el.volume = compat ? clamp01(volume) : 1.0; // en compat, volume via <audio>
+        await el.play(); // nécessite un clic utilisateur antérieur (MARCHE)
+        ok = true;
+        break;
+      } catch (e) {
+        lastErr = e;
       }
+    }
+    if (!ok) {
+      setEtat(`échec (CORS/format)${lastErr?.name ? " : " + lastErr.name : ""}`);
+      return;
+    }
+
+    // Lecture OK → tente de brancher WebAudio (filtre/mix)
+    try {
+      if (!mediaSrcRef.current) {
+        const src = ctxRef.current.createMediaElementSource(el);
+        mediaSrcRef.current = src;
+        src.connect(radioGainRef.current);
+      }
+      setCompat(false);
+      setEtat("lecture");
+      smooth(radioGainRef.current.gain, volume, 0.28);
       smooth(noiseGainRef.current.gain, bruit, 0.38);
     } catch {
-      setEtat("échec (CORS/format)");
+      // CORS bloque WebAudio → mode compat : la radio joue sans filtre
+      setCompat(true);
+      rechain(filtre, /*compatMode*/ true);
+      setEtat("lecture (compatibilité)");
+      smooth(noiseGainRef.current.gain, bruit, 0.38);
     }
   }
 
@@ -202,7 +239,7 @@ export default function Page() {
     } catch {}
   }
 
-  // ——— Balayage auto
+  /* ————— Balayage auto ————— */
   function startSweepTimer() {
     stopSweepTimer();
     const interval = msFromSpeed(vitesse);
@@ -219,7 +256,7 @@ export default function Page() {
     sweepTimerRef.current = null;
   }
 
-  // ——— Enregistrer
+  /* ————— Enregistrement ————— */
   function toggleEnr() {
     if (!destRef.current) return;
     if (!enr) {
@@ -240,11 +277,14 @@ export default function Page() {
     }
   }
 
-  // ——— Réactions
-  useEffect(() => { if (radioGainRef.current) radioGainRef.current.gain.value = volume; if (audioElRef.current && compat) audioElRef.current.volume = clamp01(volume); }, [volume, compat]);
-  useEffect(() => { if (noiseGainRef.current)  noiseGainRef.current.gain.value  = bruit; }, [bruit]);
-  useEffect(() => { if (bandpassRef.current)   bandpassRef.current.Q.value     = q; }, [q]);
-  useEffect(() => { if (bandpassRef.current)   bandpassRef.current.frequency.value = Math.max(60, fMin); }, [fMin]);
+  /* ————— Réactions ————— */
+  useEffect(() => { 
+    if (radioGainRef.current) radioGainRef.current.gain.value = volume; 
+    if (audioElRef.current && compat) audioElRef.current.volume = clamp01(volume);
+  }, [volume, compat]);
+  useEffect(() => { if (noiseGainRef.current) noiseGainRef.current.gain.value = bruit; }, [bruit]);
+  useEffect(() => { if (bandpassRef.current) bandpassRef.current.Q.value = q; }, [q]);
+  useEffect(() => { if (bandpassRef.current) bandpassRef.current.frequency.value = Math.max(60, fMin); }, [fMin]);
   useEffect(() => { if (ctxRef.current) rechain(filtre, compat); }, [filtre, compat]);
 
   useEffect(() => {
@@ -253,7 +293,7 @@ export default function Page() {
     return stopSweepTimer;
   }, [autoSweep, vitesse, marche]);
 
-  // ——— VU
+  /* ————— VU ————— */
   function startVuLoop() {
     const analyser = analyserRef.current;
     if (!analyser) return;
@@ -274,14 +314,14 @@ export default function Page() {
     requestAnimationFrame(loop);
   }
 
-  // ——— UI
+  /* ————— UI ————— */
   const tuneValue = STATIONS.length > 1 ? stationIndex / (STATIONS.length - 1) : 0;
 
   return (
     <main style={styles.page}>
       <div style={styles.shadowWrap}>
         <div style={styles.cabinet}>
-          {/* entête */}
+          {/* En-tête */}
           <div style={styles.headerBar}>
             <div style={styles.brandPlate}>
               <div style={styles.brandText}>MADAME FANTÔMES</div>
@@ -293,12 +333,12 @@ export default function Page() {
             </div>
           </div>
 
-          {/* cadran */}
+          {/* Cadran */}
           <div style={styles.glass}>
             <div style={styles.scaleWrap}>
               <div style={styles.scaleGrid} />
               {STATIONS.map((s, i) => (
-                <div key={s.url} style={{ ...styles.tick, left: `${(i/(STATIONS.length-1))*100}%` }} />
+                <div key={s.name} style={{ ...styles.tick, left: `${(i/(STATIONS.length-1))*100}%` }} />
               ))}
               <div style={{ ...styles.needle, left: `${tuneValue*100}%` }} />
             </div>
@@ -307,14 +347,11 @@ export default function Page() {
               <div><em style={{ opacity: 0.9 }}>{etat}</em></div>
             </div>
             {compat && (
-              <div style={styles.compatBanner}>
-                Mode compatibilité CORS : filtre inactif sur la radio
-              </div>
+              <div style={styles.compatBanner}>Mode compatibilité CORS : filtre inactif sur la radio</div>
             )}
-            <div style={styles.scratches} aria-hidden />
           </div>
 
-          {/* grille + VU */}
+          {/* Grille + VU */}
           <div style={styles.speakerSection}>
             <div style={styles.grill} />
             <div style={styles.vuWrap}>
@@ -323,7 +360,7 @@ export default function Page() {
             </div>
           </div>
 
-          {/* contrôles */}
+          {/* Contrôles */}
           <div style={styles.controlsRow}>
             <div style={styles.colLeft}>
               <Switch label="MARCHE" on={marche} onChange={async v => { setMarche(v); v ? await marcheOn() : marcheOff(); }} />
@@ -366,13 +403,13 @@ export default function Page() {
       </div>
 
       <p style={{ color: "rgba(255,255,255,0.7)", marginTop: 14, fontSize: 12 }}>
-        Tip : active <strong>MARCHE</strong> puis joue avec <strong>RÉGLAGE</strong>, <strong>FILTRE</strong> et <strong>BRUIT</strong>.
+        Tip : active <strong>MARCHE</strong>, puis joue avec <strong>RÉGLAGE</strong>, <strong>FILTRE</strong> et <strong>BRUIT</strong>.
       </p>
     </main>
   );
 }
 
-/* ————— Widgets UI ————— */
+/* ————— UI widgets ————— */
 
 function Knob({ label, value, onChange, hint }) {
   const [drag, setDrag] = useState(null);
@@ -402,7 +439,12 @@ function BigKnob({ label, value, onChange }) {
       <div
         style={{ ...ui.bigKnob, transform: `rotate(${angle}deg)` }}
         onPointerDown={(e) => { e.currentTarget.setPointerCapture(e.pointerId); setDrag({ x: e.clientX, y: e.clientY, v: value }); }}
-        onPointerMove={(e) => { if (!drag) return; const dy = (drag.y - e.clientY) / 340; const dx = (e.clientX - drag.x) / 420; onChange(drag.v + dy + dx * 0.25); }}
+        onPointerMove={(e) => {
+          if (!drag) return;
+          const dy = (drag.y - e.clientY) / 340;
+          const dx = (e.clientX - drag.x) / 420;
+          onChange(drag.v + dy + dx * 0.25);
+        }}
         onPointerUp={() => setDrag(null)} onPointerCancel={() => setDrag(null)}
       >
         <div style={ui.bigKnobIndicator} />
@@ -475,9 +517,10 @@ const styles = {
     width: "min(980px, 94vw)", borderRadius: 26, padding: 16,
     border: "1px solid rgba(30,20,10,0.6)",
     boxShadow: "0 28px 80px rgba(0,0,0,0.65), inset 0 0 0 1px rgba(255,255,255,0.03)",
-    background:
-      "linear-gradient(180deg,#4b3425,#3c2a1f 40%,#34241b 100%), " +
-      "repeating-linear-gradient(45deg, rgba(255,255,255,0.05) 0 1px, rgba(0,0,0,0.06) 1px 2px)",
+    // 👉 on superpose le SVG (image) et des couches sombres pour l’ambiance
+    backgroundImage: "url('/radio-vintage.svg'), linear-gradient(180deg, rgba(0,0,0,0.12), rgba(0,0,0,0.18))",
+    backgroundSize: "cover",
+    backgroundPosition: "center",
     position: "relative", overflow: "hidden"
   },
   headerBar: { display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 12 },
@@ -492,7 +535,7 @@ const styles = {
 
   glass: {
     borderRadius: 16, border: "1px solid #2b2e3a",
-    background: "linear-gradient(180deg, rgba(16,18,26,0.95), rgba(10,12,18,0.95)), radial-gradient(800px 200px at 50% -80px, rgba(255,255,255,0.06), transparent 60%)",
+    background: "linear-gradient(180deg, rgba(16,18,26,0.9), rgba(10,12,18,0.9))",
     padding: 12, position: "relative", overflow: "hidden", boxShadow: "inset 0 0 28px rgba(0,0,0,0.5)"
   },
   scaleWrap: { position: "relative", height: 54, borderRadius: 10, border: "1px solid #252834", background: "#0d0f15", overflow: "hidden", marginBottom: 8 },
@@ -500,7 +543,6 @@ const styles = {
   tick: { position: "absolute", top: 0, width: 2, height: "100%", background: "rgba(240,210,140,0.7)", transform: "translateX(-1px)" },
   needle: { position: "absolute", top: 0, width: 2, height: "100%", background: "#f05a6e", boxShadow: "0 0 10px rgba(240,90,110,0.7), 0 0 20px rgba(240,90,110,0.35)", transform: "translateX(-1px)" },
   stationRow: { display: "flex", justifyContent: "space-between", color: "#eae7f5", fontSize: 13, padding: "0 2px" },
-  scratches: { position: "absolute", inset: 0, pointerEvents: "none", background: "linear-gradient(transparent, rgba(255,255,255,0.03) 20%, transparent 60%), repeating-linear-gradient(120deg, rgba(255,255,255,0.03) 0 1px, transparent 1px 4px)" },
 
   compatBanner: {
     position: "absolute", right: 10, bottom: 10,
