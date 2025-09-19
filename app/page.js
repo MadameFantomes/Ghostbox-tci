@@ -1,19 +1,17 @@
 "use client";
 
 /**
- * Ghostbox TCI — UI simple (FR)
- * Contrôles: MARCHE, BALAYAGE AUTO, VITESSE, VOLUME, ÉCHO, DÉBIT (bruit de balayage)
- * - Bruit blanc audible ENTRE stations (durée/intensité = "DÉBIT")
- * - Écho simple (mix + feedback doux)
- * - Compat CORS: si un flux bloque WebAudio, la radio joue quand même; on mute la radio
- *   pendant le burst de bruit via <audio>.volume pour garder l'effet de balayage.
- * - Lit un gros catalogue si /stations.json existe (sinon fallback).
- * - Fond SVG aquarelle: /radio-vintage.svg
+ * Ghostbox TCI — Simple FR (balayage toutes stations)
+ * - Lit /public/stations.json si présent (formats acceptés: tableau [{name,url}] ou objet {Groupe:[{name,url}|{name,urls:[]}]}).
+ * - Déplie urls[], déduplique par URL, ne garde que HTTPS.
+ * - Balayage AUTO corrigé (index courant via ref).
+ * - Contrôles: MARCHE, BALAYAGE AUTO, VITESSE, VOLUME, ÉCHO, DÉBIT (bruit inter-station).
+ * - Fond: /radio-vintage.svg.
  */
 
 import React, { useEffect, useRef, useState } from "react";
 
-/* ——— Fallback minimal si /stations.json n'est pas trouvé ——— */
+/* ——— Fallback minimal si /stations.json absent ——— */
 const FALLBACK_STATIONS = [
   "https://icecast.radiofrance.fr/fip-midfi.mp3",
   "https://icecast.radiofrance.fr/fiprock-midfi.mp3",
@@ -22,104 +20,137 @@ const FALLBACK_STATIONS = [
   "https://stream.srg-ssr.ch/srgssr/rsj/aac/96",
   "https://stream.srg-ssr.ch/srgssr/rsc/aac/96",
   "https://stream.srg-ssr.ch/srgssr/rsp/aac/96"
-].map((url) => ({ name: url.split("/")[2], url }));
+].map((url) => ({ name: new URL(url).host, url }));
 
 export default function Page() {
   const audioElRef = useRef(null);
 
-  // AudioContext & nodes
+  // Audio graph
   const ctxRef = useRef(null);
   const masterRef = useRef(null);
   const destRef = useRef(null);
-
   const mediaSrcRef = useRef(null);
   const radioGainRef = useRef(null);
-
   const noiseNodeRef = useRef(null);
   const noiseGainRef = useRef(null);
-
-  // Echo (simple)
+  const dryRef = useRef(null);
   const echoDelayRef = useRef(null);
   const echoFbRef = useRef(null);
   const echoWetRef = useRef(null);
-  const dryRef = useRef(null);
 
-  // UI state
+  // Stations et index
   const [stations, setStations] = useState(FALLBACK_STATIONS);
+  const stationsRef = useRef(FALLBACK_STATIONS);
   const [idx, setIdx] = useState(0);
+  const idxRef = useRef(0);
+
+  // UI
   const [etat, setEtat] = useState("prêt");
   const [marche, setMarche] = useState(false);
   const [auto, setAuto] = useState(false);
+  const [compat, setCompat] = useState(false);
+  const sweepTimerRef = useRef(null);
 
-  // 4 réglages demandés
+  // 4 contrôles
   const [vitesse, setVitesse] = useState(0.45); // 0..1 → 250..2500ms
   const [volume, setVolume]   = useState(0.9);  // master
-  const [echo, setEcho]       = useState(0.3);  // 0..1 → mix + fb léger
-  const [debit, setDebit]     = useState(0.5);  // 0..1 → durée/intensité du bruit inter-station
-
-  const sweepTimerRef = useRef(null);
-  const [compat, setCompat] = useState(false);
+  const [echo, setEcho]       = useState(0.3);  // mix + fb doux
+  const [debit, setDebit]     = useState(0.5);  // durée/intensité bruit blanc
 
   // Helpers
   const clamp01 = (x) => Math.max(0, Math.min(1, x));
-  const msFromSpeed = (v) => Math.round(250 + v * (2500 - 250)); // 250..2500 ms
-  const burstMs = () => Math.round(40 + debit * 420);            // 40..460 ms de bruit
-  const burstGain = () => 0.15 + debit * 0.85;                   // niveau de bruit 0.15..1
+  const msFromSpeed = (v) => Math.round(250 + v * (2500 - 250));  // 250..2500 ms
+  const burstMs = () => Math.round(40 + debit * 420);             // 40..460 ms
+  const burstGain = () => 0.15 + debit * 0.85;                    // 0.15..1
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-  /* ——— Charger un gros catalogue si présent ——— */
+  /* ——— Charge /stations.json si présent ——— */
   useEffect(() => {
     fetch("/stations.json")
       .then((r) => (r.ok ? r.json() : Promise.reject()))
       .then((json) => {
-        // Aplatit { "Groupe": [ {name,url}, ... ], ... } → [{name,url}, ...]
-        const flat = Object.values(json)
-          .flat()
-          .filter((s) => s && s.url)
-          .map((s) => ({ name: s.name || s.url.split("/")[2], url: s.url }));
-        if (flat.length) setStations(flat);
+        const flat = normalizeStationsJson(json);
+        if (flat.length) {
+          setStations(flat);
+          stationsRef.current = flat;
+          // si on était hors bornes, on remet à 0
+          setIdx(0); idxRef.current = 0;
+        }
       })
-      .catch(() => {}); // fallback déjà prêt
+      .catch(() => {
+        stationsRef.current = FALLBACK_STATIONS;
+      });
   }, []);
 
-  /* ——— Init WebAudio ——— */
+  function normalizeStationsJson(json) {
+    let list = [];
+    const push = (name, url, suffix="") => {
+      if (!url || typeof url !== "string") return;
+      if (!/^https:/i.test(url)) return; // HTTPS only
+      list.push({ name: name || new URL(url).host + suffix, url });
+    };
+
+    if (Array.isArray(json)) {
+      json.forEach((s, i) => {
+        if (!s) return;
+        if (s.url) push(s.name, s.url);
+        if (Array.isArray(s.urls)) s.urls.forEach((u, k) => push(s.name, u, ` #${k+1}`));
+      });
+    } else if (json && typeof json === "object") {
+      Object.entries(json).forEach(([group, arr]) => {
+        if (!Array.isArray(arr)) return;
+        arr.forEach((s, i) => {
+          if (!s) return;
+          if (s.url) push(s.name || `${group}`, s.url);
+          if (Array.isArray(s.urls)) s.urls.forEach((u, k) => push(s.name || `${group}`, u, ` #${k+1}`));
+        });
+      });
+    }
+
+    // dédup par URL
+    const seen = new Set();
+    list = list.filter((s) => {
+      if (seen.has(s.url)) return false;
+      seen.add(s.url);
+      return true;
+    });
+
+    // option: mélange pour varier
+    for (let i = list.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [list[i], list[j]] = [list[j], list[i]];
+    }
+    return list;
+  }
+
+  /* ——— Init audio ——— */
   async function initAudio() {
     if (ctxRef.current) return;
     const ctx = new (window.AudioContext || window.webkitAudioContext)();
     ctxRef.current = ctx;
 
-    // master + enregistrement
     const master = ctx.createGain(); master.gain.value = volume; master.connect(ctx.destination);
     masterRef.current = master;
     const dest = ctx.createMediaStreamDestination(); master.connect(dest);
     destRef.current = dest;
 
-    // voie radio
     const gRadio = ctx.createGain(); gRadio.gain.value = 1; radioGainRef.current = gRadio;
 
-    // bruit blanc (pour le balayage)
     const gNoise = ctx.createGain(); gNoise.gain.value = 0; noiseGainRef.current = gNoise;
-    const noise = createNoiseNode(ctx); noiseNodeRef.current = noise;
+    const noise = createNoiseNode(ctx); noiseNodeRef.current = noise; try { noise.start(0); } catch {}
 
-    // split dry/FX
     const dry = ctx.createGain(); dry.gain.value = 1; dryRef.current = dry;
 
-    // ÉCHO simple (mix & fb)
     const dly = ctx.createDelay(1.2); dly.delayTime.value = 0.32;
-    const fb  = ctx.createGain(); fb.gain.value = 0.25; // ajusté par setEcho()
+    const fb  = ctx.createGain(); fb.gain.value = 0.25;
     dly.connect(fb); fb.connect(dly);
-    const wet = ctx.createGain(); wet.gain.value = 0;   // mix, ajusté par setEcho()
-
+    const wet = ctx.createGain(); wet.gain.value = 0;
     echoDelayRef.current = dly; echoFbRef.current = fb; echoWetRef.current = wet;
 
-    // Routing: (radio + bruit) → dry + echo → master
     const sum = ctx.createGain(); sum.gain.value = 1;
     gRadio.connect(sum); gNoise.connect(sum);
-
     sum.connect(dry);  dry.connect(master);
-    sum.connect(dly);  dly.connect(wet);  wet.connect(master);
-
-    try { noise.start(0); } catch {}
+    sum.connect(dly);  dly.connect(wet); wet.connect(master);
   }
 
   function createNoiseNode(ctx) {
@@ -139,17 +170,16 @@ export default function Page() {
       mediaSrcRef.current = src; src.connect(radioGainRef.current);
       setCompat(false);
     } catch {
-      // CORS bloque WebAudio → lecture directe uniquement
-      setCompat(true);
+      setCompat(true); // CORS bloque WebAudio
     }
   }
 
-  /* ——— MARCHE ——— */
+  /* ——— Power ——— */
   async function powerOn() {
     await initAudio();
     const ctx = ctxRef.current;
     if (ctx.state === "suspended") await ctx.resume();
-    await tuneTo(idx);
+    await tuneTo(idxRef.current);
     setMarche(true);
   }
   function powerOff() {
@@ -163,18 +193,20 @@ export default function Page() {
     setEtat("arrêté");
   }
 
-  /* ——— Bruit inter-stations + tuning ——— */
+  /* ——— Tuning + bruit inter-stations ——— */
   async function tuneTo(nextIndex) {
     const el = audioElRef.current; if (!el) return;
-    const url = stations[nextIndex]?.url || stations[nextIndex];
+    const list = stationsRef.current;
+    const entry = list[nextIndex];
+    if (!entry) return;
+    const url = typeof entry === "string" ? entry : entry.url;
 
-    // 1) burst de bruit — on baisse la radio, on monte le bruit
+    // Burst de bruit (balayage)
     const ctx = ctxRef.current;
     const now = ctx.currentTime;
     const burstDur = burstMs() / 1000;
 
     if (!compat) {
-      // via WebAudio
       try {
         radioGainRef.current.gain.cancelScheduledValues(now);
         radioGainRef.current.gain.linearRampToValueAtTime(0.0001, now + 0.06);
@@ -184,8 +216,7 @@ export default function Page() {
         noiseGainRef.current.gain.setTargetAtTime(burstGain(), now, 0.04);
       } catch {}
     } else {
-      // compat: on mute la balise <audio> le temps du bruit
-      el.volume = 0;
+      el.volume = 0; // mute <audio> en compat pendant le bruit
       try {
         noiseGainRef.current.gain.cancelScheduledValues(now);
         noiseGainRef.current.gain.setTargetAtTime(burstGain(), now, 0.04);
@@ -195,7 +226,7 @@ export default function Page() {
     setEtat("balayage…");
     await sleep(Math.max(60, burstMs() * 0.45));
 
-    // 2) charger et jouer la station suivante
+    // Charger/lecture
     try {
       el.crossOrigin = "anonymous";
       el.pause(); el.src = url; el.load();
@@ -206,32 +237,31 @@ export default function Page() {
       return;
     }
 
-    // 3) tenter de brancher la radio dans WebAudio (si possible)
     await attachMedia();
 
-    // 4) fondu retour: on remonte la radio, on coupe le bruit
+    // Fondu retour
     const after = ctx.currentTime + Math.max(0.08, burstDur * 0.6);
     if (!compat) {
-      try {
-        radioGainRef.current.gain.setTargetAtTime(1, after, 0.08);
-      } catch {}
+      try { radioGainRef.current.gain.setTargetAtTime(1, after, 0.08); } catch {}
     } else {
       el.volume = clamp01(volume);
     }
-    try {
-      noiseGainRef.current.gain.setTargetAtTime(0.0001, after, 0.1);
-    } catch {}
+    try { noiseGainRef.current.gain.setTargetAtTime(0.0001, after, 0.1); } catch {}
 
+    // Met à jour l’index courant (state + ref)
+    idxRef.current = nextIndex;
     setIdx(nextIndex);
     setEtat(compat ? "lecture (compatibilité)" : "lecture");
   }
 
-  /* ——— Balayage AUTO ——— */
+  /* ——— Balayage AUTO (corrigé: utilise idxRef) ——— */
   function startSweep() {
     stopSweep();
     const step = async () => {
       if (!marche) return;
-      const next = (idx + 1) % stations.length;
+      const list = stationsRef.current;
+      if (!list.length) return;
+      const next = (idxRef.current + 1) % list.length;
       await tuneTo(next);
       sweepTimerRef.current = setTimeout(step, msFromSpeed(vitesse));
     };
@@ -242,48 +272,51 @@ export default function Page() {
     sweepTimerRef.current = null;
   }
 
-  /* ——— Réactions aux contrôles ——— */
+  /* ——— Réactions contrôles ——— */
   useEffect(() => {
     if (masterRef.current) masterRef.current.gain.value = clamp01(volume);
     if (audioElRef.current && compat) audioElRef.current.volume = clamp01(volume);
   }, [volume, compat]);
 
   useEffect(() => {
-    // un seul bouton "ÉCHO": on pilote mix + un peu de feedback
     if (!echoWetRef.current || !echoFbRef.current) return;
-    echoWetRef.current.gain.value = echo * 0.9;     // mix
-    echoFbRef.current.gain.value = Math.min(0.6, echo * 0.6); // feedback doux
+    echoWetRef.current.gain.value = echo * 0.9;
+    echoFbRef.current.gain.value = Math.min(0.6, echo * 0.6);
   }, [echo]);
 
   useEffect(() => {
     if (!auto) { stopSweep(); return; }
     if (marche) startSweep();
     return stopSweep;
-  }, [auto, vitesse, marche, idx, stations.length]);
+  }, [auto, vitesse, marche]);
 
   /* ——— UI ——— */
-  const currentName = stations[idx]?.name || new URL(stations[idx]?.url || stations[idx]).host;
+  const list = stationsRef.current;
+  const currentName = list[idxRef.current]?.name || (list[idxRef.current]?.url ? new URL(list[idxRef.current].url).host : "");
 
   return (
     <main style={styles.page}>
       <div style={styles.shadowWrap}>
         <div style={styles.cabinet}>
-          {/* Titre + voyants */}
+          {/* Titre + badge nombre de stations */}
           <div style={styles.headerBar}>
             <div style={styles.brandPlate}>
               <div style={styles.brandText}>MADAME FANTÔMES</div>
               <div style={styles.brandSub}>Ghostbox • Formation TCI</div>
             </div>
-            <div style={styles.lampsRow}>
-              <Lamp label="MARCHE" on={marche} />
-              <Lamp label="AUTO" on={auto} colorOn="#86fb6a" />
+            <div style={styles.rightHeader}>
+              <div style={styles.badge}>{list.length} stations chargées</div>
+              <div style={styles.lampsRow}>
+                <Lamp label="MARCHE" on={marche} />
+                <Lamp label="AUTO" on={auto} colorOn="#86fb6a" />
+              </div>
             </div>
           </div>
 
-          {/* Cadran */}
+          {/* Cadran / état */}
           <div style={styles.glass}>
             <div style={styles.stationRow}>
-              <div><strong>{currentName}</strong></div>
+              <div><strong>{currentName || "—"}</strong></div>
               <div><em style={{ opacity: 0.9 }}>{etat}</em></div>
             </div>
             {compat && (
@@ -294,20 +327,13 @@ export default function Page() {
           {/* Contrôles */}
           <div style={styles.controlsRow}>
             <div style={styles.switches}>
-              <Switch
-                label="MARCHE"
-                on={marche}
-                onChange={async v => { setMarche(v); v ? await powerOn() : powerOff(); }}
-              />
-              <Switch
-                label="BALAYAGE AUTO"
-                on={auto}
-                onChange={(v) => setAuto(v)}
-              />
-              <Bouton
-                label="SUIVANTE"
-                onClick={async () => { const next = (idx + 1) % stations.length; await tuneTo(next); }}
-              />
+              <Switch label="MARCHE" on={marche} onChange={async v => { setMarche(v); v ? await powerOn() : powerOff(); }} />
+              <Switch label="BALAYAGE AUTO" on={auto} onChange={(v) => setAuto(v)} />
+              <Bouton label="SUIVANTE" onClick={async () => {
+                const list = stationsRef.current;
+                const next = (idxRef.current + 1) % list.length;
+                await tuneTo(next);
+              }} />
             </div>
 
             <div style={styles.knobs}>
@@ -325,13 +351,13 @@ export default function Page() {
       </div>
 
       <p style={{ color: "rgba(255,255,255,0.7)", marginTop: 10, fontSize: 12 }}>
-        Astuce : mets <strong>AUTO</strong>, ajuste <strong>VITESSE</strong> et <strong>DÉBIT</strong> pour bien entendre le <em>bruit de balayage</em> entre les stations.
+        Astuce : vérifie <code>/stations.json</code> dans ton navigateur — le badge doit afficher le bon total. Mets <strong>AUTO</strong> pour balayer toutes les stations.
       </p>
     </main>
   );
 }
 
-/* ——— Widgets UI ——— */
+/* ——— UI widgets ——— */
 
 function Knob({ label, value, onChange, hint }) {
   const [drag, setDrag] = useState(null);
@@ -357,7 +383,7 @@ function Switch({ label, on, onChange }) {
     <div style={ui.switchBlock} onClick={() => onChange(!on)}>
       <div style={ui.switchLabel}>{label}</div>
       <div style={{ ...ui.switch, background: on ? "#6ad27a" : "#464a58" }}>
-        <div style={{ ...ui.switchDot, transform: `translateX(${on ? 20 : 0}px)` }} />
+        <div style={{ ...ui.switchDot, transform: `translateX(${on ? 32 : 0}px)` }} />
       </div>
     </div>
   );
@@ -406,6 +432,12 @@ const styles = {
   },
   brandText: { fontWeight: 800, letterSpacing: 2, fontSize: 13 },
   brandSub: { fontSize: 11, opacity: 0.75 },
+
+  rightHeader: { display: "flex", alignItems: "center", gap: 12 },
+  badge: {
+    fontSize: 12, color: "#0b0b10", background: "#f0c14b",
+    border: "1px solid #2b2e3a", padding: "4px 8px", borderRadius: 10, fontWeight: 800
+  },
   lampsRow: { display: "flex", gap: 14, alignItems: "center" },
 
   glass: {
@@ -447,20 +479,10 @@ const ui = {
 
   switchBlock: { display: "grid", gridTemplateColumns: "auto 1fr", alignItems: "center", gap: 10, cursor: "pointer" },
   switchLabel: { color: "#f0e7d1", fontSize: 12, letterSpacing: 1.2 },
-  switch: { width: 56, height: 24, borderRadius: 14, position: "relative", border: "1px solid #2b2b36" },
-  switchDot: { width: 22, height: 22, borderRadius: "50%", background: "#0b0b10", border: "1px solid #2b2b36", position: "absolute", top: 1, left: 1, transition: "transform .15s" },
+  switch: { width: 64, height: 26, borderRadius: 16, position: "relative", border: "1px solid #2b2b36" },
+  switchDot: { width: 24, height: 24, borderRadius: "50%", background: "#0b0b10", border: "1px solid #2b2b36", position: "absolute", top: 1, left: 1, transition: "transform .15s" },
 
-  button: {
-    cursor: "pointer",
-    border: "1px solid #2b2b36",
-    borderRadius: 12,
-    padding: "10px 14px",
-    fontWeight: 800,
-    fontSize: 13,
-    color: "#0b0b10",
-    boxShadow: "0 6px 18px rgba(0,0,0,0.35)",
-    background: "#5b4dd6"
-  },
+  button: { cursor: "pointer", border: "1px solid #2b2b36", borderRadius: 12, padding: "10px 14px", fontWeight: 800, fontSize: 13, color: "#0b0b10", boxShadow: "0 6px 18px rgba(0,0,0,0.35)", background: "#5b4dd6" },
 
   lamp: { display: "grid", gridTemplateColumns: "auto auto", gap: 6, alignItems: "center" },
   lampDot: { width: 12, height: 12, borderRadius: "50%" },
