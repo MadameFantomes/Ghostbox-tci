@@ -1,35 +1,28 @@
 "use client";
 
 /**
- * Ghostbox TCI — Radio vintage UI (live radio + WebAudio)
- * Contrôles:
- *  - POWER (on/off) : démarre/arrête l'audio
- *  - TUNING (gros bouton à droite) : change de station
- *  - VOLUME : niveau de la radio
- *  - NOISE : niveau du bruit blanc
- *  - FILTER (switch) : active/désactive band-pass
- *  - AUTO SWEEP (switch) : saute de station automatiquement
- *  - SWEEP SPEED : vitesse de balayage entre stations
- *  - RECORD (bouton rouge) : enregistre en .webm
- *
- * Astuce: un premier clic sur POWER suffit à “débloquer” l’audio (politique navigateur).
+ * Ghostbox TCI — Radio Vintage (live)
+ * - Vraies stations (HTTPS/CORS-friendly)
+ * - POWER, TUNING, VOLUME, NOISE, FILTER (band-pass), AUTO SWEEP + vitesse
+ * - Enregistrement .webm (MediaRecorder)
+ * - VU-mètres animés (AnalyserNode)
+ * - UI 100% CSS (bois, vitre, vis, cadran rétro)
  */
 
 import React, { useEffect, useRef, useState } from "react";
 
-// ————————————————————— Stations test (HTTPS + CORS-friendly) —————————————————————
+// —————————————————— Stations (tu peux en ajouter) ——————————————————
 const STATIONS = [
-  { name: "RadioMast Reference MP3", url: "https://streams.radiomast.io/reference-mp3" },
-  { name: "RadioMast Reference AAC", url: "https://streams.radiomast.io/reference-aac" },
-  { name: "Radio Swiss Jazz (96k AAC)", url: "https://stream.srg-ssr.ch/srgssr/rsj/aac/96" },
-  { name: "Radio Swiss Classic (96k AAC)", url: "https://stream.srg-ssr.ch/srgssr/rsc/aac/96" }
+  { name: "RadioMast MP3", url: "https://streams.radiomast.io/reference-mp3" },
+  { name: "RadioMast AAC", url: "https://streams.radiomast.io/reference-aac" },
+  { name: "Swiss Jazz (96k)", url: "https://stream.srg-ssr.ch/srgssr/rsj/aac/96" },
+  { name: "Swiss Classic (96k)", url: "https://stream.srg-ssr.ch/srgssr/rsc/aac/96" }
 ];
 
-// ————————————————————— Composant principal —————————————————————
 export default function Page() {
   const audioElRef = useRef(null);
 
-  // Audio graph
+  // WebAudio graph
   const ctxRef = useRef(null);
   const destRef = useRef(null);
   const masterGainRef = useRef(null);
@@ -38,36 +31,38 @@ export default function Page() {
   const noiseNodeRef = useRef(null);
   const noiseGainRef = useRef(null);
   const bandpassRef = useRef(null);
+  const analyserRef = useRef(null);
 
-  // État UI
+  // UI state
   const [power, setPower] = useState(false);
   const [stationIndex, setStationIndex] = useState(0);
   const [status, setStatus] = useState("prêt");
 
-  const [volume, setVolume] = useState(0.9);      // 0..1
-  const [noise, setNoise] = useState(0.25);       // 0..1
+  const [volume, setVolume] = useState(0.9);
+  const [noise, setNoise] = useState(0.25);
   const [filterOn, setFilterOn] = useState(true);
-  const [q, setQ] = useState(1.0);
-  const [fMin, setFMin] = useState(250);
-  const [fMax, setFMax] = useState(3500);
+  const [q, setQ] = useState(1.2);
+  const [fMin, setFMin] = useState(280);
+  const [fMax] = useState(3800); // (affiché, range futur si tu veux balayer en continu)
 
   const [autoSweep, setAutoSweep] = useState(false);
-  const [sweepSpeed, setSweepSpeed] = useState(0.4); // 0..1 ⇒ 300..2000 ms
+  const [sweepSpeed, setSweepSpeed] = useState(0.45); // 0..1 (→ ms)
   const sweepTimerRef = useRef(null);
 
-  // Recording
+  // Recorder
   const [isRecording, setIsRecording] = useState(false);
   const recRef = useRef(null);
   const chunksRef = useRef([]);
 
-  // ——— Helpers ———
-  function msFromSpeed(v) {
-    // 0 → 300ms (rapide), 1 → 2000ms (lent)
-    return Math.round(300 + v * (2000 - 300));
-  }
-  function clamp01(x) { return Math.max(0, Math.min(1, x)); }
+  // VU meter level (0..1)
+  const [vuL, setVuL] = useState(0);
+  const [vuR, setVuR] = useState(0);
 
-  // ——— Init WebAudio ———
+  // Helpers
+  function clamp01(x) { return Math.max(0, Math.min(1, x)); }
+  function msFromSpeed(v) { return Math.round(300 + v * (2000 - 300)); } // 300ms rapide → 2000ms lent
+
+  // ——— Init
   async function initAudio() {
     if (ctxRef.current) return;
     const ctx = new (window.AudioContext || window.webkitAudioContext)();
@@ -84,7 +79,7 @@ export default function Page() {
     master.connect(dest);
     destRef.current = dest;
 
-    // band-pass
+    // bandpass
     const band = ctx.createBiquadFilter();
     band.type = "bandpass";
     band.Q.value = q;
@@ -98,14 +93,22 @@ export default function Page() {
     // bruit blanc
     const n = createNoiseNode(ctx); noiseNodeRef.current = n;
 
-    // routing initial
+    // analyser pour VU
+    const analyser = ctx.createAnalyser();
+    analyser.fftSize = 512;
+    analyserRef.current = analyser;
+
+    // routing
     rechain(filterOn);
+    // brancher le master AU-DESSUS de destination sur l'analyseur
+    master.connect(analyser);
+    startVuLoop();
   }
 
   function rechain(useFilter) {
-    try { radioGainRef.current.disconnect(); } catch {}
-    try { noiseGainRef.current.disconnect(); } catch {}
-    try { bandpassRef.current.disconnect(); } catch {}
+    try { radioGainRef.current?.disconnect(); } catch {}
+    try { noiseGainRef.current?.disconnect(); } catch {}
+    try { bandpassRef.current?.disconnect(); } catch {}
 
     if (useFilter) {
       radioGainRef.current.connect(bandpassRef.current);
@@ -138,23 +141,18 @@ export default function Page() {
     src.connect(radioGainRef.current);
   }
 
-  // ——— Power ———
+  // ——— Power
   async function powerOn() {
     await initAudio();
     const ctx = ctxRef.current;
     if (ctx.state === "suspended") await ctx.resume();
-
-    // démarre bruit (idempotent)
     try { noiseNodeRef.current.start(0); } catch {}
-
     await attachMedia();
     await tuneTo(stationIndex);
     setPower(true);
   }
-
   function powerOff() {
     stopSweepTimer();
-    // stop lecture
     if (audioElRef.current) {
       audioElRef.current.pause();
       audioElRef.current.src = "";
@@ -164,25 +162,22 @@ export default function Page() {
     setStatus("arrêté");
   }
 
-  // ——— Tuning / lecture ———
+  // ——— Tuning
   async function tuneTo(index) {
     if (!audioElRef.current) return;
     const el = audioElRef.current;
     const { url } = STATIONS[index];
 
-    // petit fondu (radio down, noise up)
-    smooth(radioGainRef.current.gain, Math.max(0.12, volume * 0.25), 0.1);
-    smooth(noiseGainRef.current.gain, Math.max(noise, 0.25), 0.1);
+    // petit fondu "scan"
+    smooth(radioGainRef.current.gain, Math.max(0.12, volume * 0.25), 0.12);
+    smooth(noiseGainRef.current.gain, Math.max(noise, 0.28), 0.12);
 
-    el.pause();
-    el.src = url;
-    setStatus("connexion…");
+    el.pause(); el.src = url; setStatus("connexion…");
     try {
       await el.play();
       setStatus("lecture");
-      // remonte radio, redescend bruit
-      smooth(radioGainRef.current.gain, volume, 0.25);
-      smooth(noiseGainRef.current.gain, noise, 0.35);
+      smooth(radioGainRef.current.gain, volume, 0.28);
+      smooth(noiseGainRef.current.gain, noise, 0.38);
     } catch {
       setStatus("échec (CORS/format)");
     }
@@ -197,12 +192,12 @@ export default function Page() {
     } catch {}
   }
 
-  // ——— Sweep auto ———
+  // ——— Auto sweep
   function startSweepTimer() {
     stopSweepTimer();
     const interval = msFromSpeed(sweepSpeed);
     sweepTimerRef.current = setInterval(() => {
-      setStationIndex((prev) => {
+      setStationIndex(prev => {
         const next = (prev + 1) % STATIONS.length;
         if (power) tuneTo(next);
         return next;
@@ -214,7 +209,7 @@ export default function Page() {
     sweepTimerRef.current = null;
   }
 
-  // ——— Recording ———
+  // ——— Record
   function toggleRecord() {
     if (!destRef.current) return;
     if (!isRecording) {
@@ -235,12 +230,11 @@ export default function Page() {
     }
   }
 
-  // ——— Réactions UI → Audio ———
+  // ——— React to UI changes
   useEffect(() => { if (radioGainRef.current) radioGainRef.current.gain.value = volume; }, [volume]);
   useEffect(() => { if (noiseGainRef.current)  noiseGainRef.current.gain.value  = noise; }, [noise]);
   useEffect(() => { if (bandpassRef.current)   bandpassRef.current.Q.value     = q; }, [q]);
   useEffect(() => { if (bandpassRef.current)   bandpassRef.current.frequency.value = Math.max(60, fMin); }, [fMin]);
-  useEffect(() => { /* fMax est utilisé si on veut animer la freq de fMin→fMax ; pour l’instant on l’affiche */ }, [fMax]);
   useEffect(() => { if (ctxRef.current) rechain(filterOn); }, [filterOn]);
 
   useEffect(() => {
@@ -249,153 +243,159 @@ export default function Page() {
     return stopSweepTimer;
   }, [autoSweep, sweepSpeed, power]);
 
-  // ——— UI Vintage ———
+  // ——— VU meter loop
+  function startVuLoop() {
+    const analyser = analyserRef.current;
+    if (!analyser) return;
+    const data = new Uint8Array(analyser.fftSize);
+    function loop() {
+      analyser.getByteTimeDomainData(data);
+      // RMS approx
+      let sum = 0;
+      for (let i = 0; i < data.length; i++) {
+        const v = (data[i] - 128) / 128;
+        sum += v * v;
+      }
+      const rms = Math.sqrt(sum / data.length); // 0..~1
+      const lvl = Math.min(1, rms * 1.8);
+      // Joue un peu sur L/R pour l’esthétique
+      setVuL(l => l * 0.7 + lvl * 0.3);
+      setVuR(r => r * 0.7 + (lvl * 0.9) * 0.3);
+      requestAnimationFrame(loop);
+    }
+    requestAnimationFrame(loop);
+  }
+
+  // ——— UI computed
   const tuneValue = STATIONS.length > 1 ? stationIndex / (STATIONS.length - 1) : 0;
 
   return (
     <main style={styles.page}>
-      <div style={styles.radioBox}>
-        {/* Tête de radio : marque + cadran */}
-        <div style={styles.brandRow}>
-          <div style={styles.brand}>MADAME FANTÔMES</div>
-          <div style={styles.lamps}>
-            <Lamp label="POWER" on={power} />
-            <Lamp label="REC" on={isRecording} colorOn="#ff5050" />
-          </div>
-        </div>
-
-        <div style={styles.display}>
-          <div style={styles.scale}>
-            {STATIONS.map((s, i) => (
-              <div key={s.url} style={{ ...styles.tick, left: `${(i/(STATIONS.length-1))*100}%` }} />
-            ))}
-            <div style={{ ...styles.needle, left: `${tuneValue*100}%` }} />
-          </div>
-          <div style={styles.stationText}>
-            <strong>{STATIONS[stationIndex].name}</strong>
-            <span style={{ opacity: 0.8, marginLeft: 8 }}>— {status}</span>
-          </div>
-        </div>
-
-        {/* Grille haut-parleur */}
-        <div style={styles.grille} aria-hidden />
-
-        {/* Boutons / Contrôles */}
-        <div style={styles.controlsRow}>
-
-          {/* Colonne gauche : Power + Filter + AutoSweep */}
-          <div style={styles.leftColumn}>
-            <ToggleSwitch
-              label="POWER"
-              on={power}
-              onChange={async (v) => { setPower(v); v ? await powerOn() : powerOff(); }}
-            />
-            <ToggleSwitch
-              label="FILTER"
-              on={filterOn}
-              onChange={(v) => setFilterOn(v)}
-            />
-            <ToggleSwitch
-              label="AUTO SWEEP"
-              on={autoSweep}
-              onChange={(v) => setAutoSweep(v)}
-            />
-
-            <Knob
-              label={`SWEEP SPEED`}
-              value={sweepSpeed}
-              onChange={(v) => setSweepSpeed(clamp01(v))}
-              hint={`${msFromSpeed(sweepSpeed)} ms`}
-            />
-          </div>
-
-          {/* Centre : deux knobs (VOLUME / NOISE) + bouton REC */}
-          <div style={styles.centerColumn}>
-            <Knob
-              label={`VOLUME`}
-              value={volume}
-              onChange={(v) => setVolume(clamp01(v))}
-            />
-            <Knob
-              label={`NOISE`}
-              value={noise}
-              onChange={(v) => setNoise(clamp01(v))}
-            />
-            <Button
-              label={isRecording ? "STOP" : "RECORD"}
-              color={isRecording ? "#f0c14b" : "#d94242"}
-              onClick={toggleRecord}
-            />
-          </div>
-
-          {/* Droite : gros TUNING + params filtre fins */}
-          <div style={styles.rightColumn}>
-            <BigKnob
-              label="TUNING"
-              value={tuneValue}
-              onChange={async (v) => {
-                const idx = Math.round(clamp01(v) * (STATIONS.length - 1));
-                setStationIndex(idx);
-                if (power) await tuneTo(idx);
-              }}
-            />
-            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, marginTop: 12 }}>
-              <MiniDial label="Q" min={0.4} max={6} step={0.1} value={q} setValue={setQ} />
-              <MiniDial label="fMin" min={60} max={2000} step={20} value={fMin} setValue={setFMin} />
-              <MiniDial label="fMax" min={500} max={8000} step={50} value={fMax} setValue={setFMax} />
-              <Button
-                label="NEXT"
-                onClick={async () => {
-                  const next = (stationIndex + 1) % STATIONS.length;
-                  setStationIndex(next);
-                  if (power) await tuneTo(next);
-                }}
-              />
+      <div style={styles.shadowWrap}>
+        <div style={styles.cabinet}>
+          {/* Plaque marque + lampes */}
+          <div style={styles.headerBar}>
+            <div style={styles.brandPlate}>
+              <div style={styles.brandText}>MADAME FANTÔMES</div>
+              <div style={styles.brandSub}>Ghostbox • TCI</div>
+            </div>
+            <div style={styles.lampsRow}>
+              <Lamp label="POWER" on={power} />
+              <Lamp label="REC" on={isRecording} colorOn="#ff5656" />
             </div>
           </div>
+
+          {/* Vitre + cadran */}
+          <div style={styles.glass}>
+            <div style={styles.scaleWrap}>
+              <div style={styles.scaleGrid} />
+              {/* Ticks & labels */}
+              {STATIONS.map((s, i) => (
+                <div key={s.url} style={{ ...styles.tick, left: `${(i/(STATIONS.length-1))*100}%` }} />
+              ))}
+              <div style={{ ...styles.needle, left: `${tuneValue*100}%` }} />
+            </div>
+            <div style={styles.stationRow}>
+              <div style={styles.stationLeft}>
+                <strong>{STATIONS[stationIndex].name}</strong>
+              </div>
+              <div style={styles.stationRight}>
+                <em style={{ opacity: 0.9 }}>{status}</em>
+              </div>
+            </div>
+            {/* Micro-rayures */}
+            <div style={styles.scratches} aria-hidden />
+          </div>
+
+          {/* Grille + VU meters */}
+          <div style={styles.speakerSection}>
+            <div style={styles.grill} />
+            <div style={styles.vuWrap}>
+              <VuMeter label="VU L" value={vuL} />
+              <VuMeter label="VU R" value={vuR} />
+            </div>
+          </div>
+
+          {/* Contrôles */}
+          <div style={styles.controlsRow}>
+            {/* Col. gauche */}
+            <div style={styles.colLeft}>
+              <ToggleSwitch
+                label="POWER"
+                on={power}
+                onChange={async v => { setPower(v); v ? await powerOn() : powerOff(); }}
+              />
+              <ToggleSwitch label="FILTER" on={filterOn} onChange={setFilterOn} />
+              <ToggleSwitch label="AUTO SWEEP" on={autoSweep} onChange={setAutoSweep} />
+              <Knob label="SWEEP" value={sweepSpeed} onChange={v => setSweepSpeed(clamp01(v))} hint={`${msFromSpeed(sweepSpeed)} ms`} />
+            </div>
+
+            {/* Col. centre */}
+            <div style={styles.colCenter}>
+              <Knob label="VOLUME" value={volume} onChange={v => setVolume(clamp01(v))} />
+              <Knob label="NOISE" value={noise} onChange={v => setNoise(clamp01(v))} />
+              <Button label={isRecording ? "STOP" : "RECORD"} color={isRecording ? "#f0c14b" : "#d94242"} onClick={toggleRecord} />
+            </div>
+
+            {/* Col. droite */}
+            <div style={styles.colRight}>
+              <BigKnob
+                label="TUNING"
+                value={tuneValue}
+                onChange={async v => {
+                  const idx = Math.round(clamp01(v) * (STATIONS.length - 1));
+                  setStationIndex(idx);
+                  if (power) await tuneTo(idx);
+                }}
+              />
+              <div style={styles.subDials}>
+                <MiniDial label="Q" min={0.4} max={6} step={0.1} value={q} setValue={setQ} />
+                <MiniDial label="fMin" min={60} max={2000} step={20} value={fMin} setValue={setFMin} />
+                <Button label="NEXT" onClick={async () => {
+                  const next = (stationIndex + 1) % STATIONS.length;
+                  setStationIndex(next); if (power) await tuneTo(next);
+                }} />
+              </div>
+            </div>
+          </div>
+
+          {/* Audio element */}
+          <audio ref={audioElRef} crossOrigin="anonymous" preload="none" style={{ display: "none" }} />
         </div>
 
-        {/* Élément audio caché */}
-        <audio ref={audioElRef} crossOrigin="anonymous" preload="none" style={{ display: "none" }} />
+        {/* Décor : vis */}
+        <Screw at="tl" />
+        <Screw at="tr" />
+        <Screw at="bl" />
+        <Screw at="br" />
       </div>
 
-      <p style={{ color: "rgba(255,255,255,0.6)", marginTop: 14, fontSize: 12 }}>
-        Astuce : clique d’abord POWER, puis tourne les boutons. Tu peux activer <strong>AUTO SWEEP</strong> et régler <strong>SWEEP SPEED</strong>.
+      <p style={{ color: "rgba(255,255,255,0.7)", marginTop: 14, fontSize: 12 }}>
+        Conseil : clique d’abord <strong>POWER</strong>, puis joue avec <strong>TUNING</strong>, <strong>FILTER</strong> et <strong>NOISE</strong>.
       </p>
     </main>
   );
 }
 
-// ————————————————————— Composants UI —————————————————————
+/* —————————————— UI widgets —————————————— */
 
 function Knob({ label, value, onChange, hint }) {
   const [drag, setDrag] = useState(null);
-  const angle = -135 + value * 270; // de -135° à +135°
-
+  const angle = -135 + value * 270;
   return (
-    <div style={styles.knobBlock}>
+    <div style={ui.knobBlock}>
       <div
-        style={{
-          ...styles.knob,
-          transform: `rotate(${angle}deg)`,
-        }}
-        onPointerDown={(e) => {
-          e.currentTarget.setPointerCapture(e.pointerId);
-          setDrag({ startY: e.clientY, start: value });
-        }}
-        onPointerMove={(e) => {
-          if (!drag) return;
-          const delta = (drag.startY - e.clientY) / 200; // sensibilité
-          onChange(drag.start + delta);
-        }}
+        style={{ ...ui.knob, transform: `rotate(${angle}deg)` }}
+        onPointerDown={(e) => { e.currentTarget.setPointerCapture(e.pointerId); setDrag({ y: e.clientY, v: value }); }}
+        onPointerMove={(e) => { if (!drag) return; const delta = (drag.y - e.clientY) / 220; onChange(drag.v + delta); }}
         onPointerUp={() => setDrag(null)}
         onPointerCancel={() => setDrag(null)}
         aria-label={label}
       >
-        <div style={styles.knobIndicator} />
+        <div style={ui.knobIndicator} />
       </div>
-      <div style={styles.knobLabel}>{label}</div>
-      {hint && <div style={styles.hint}>{hint}</div>}
+      <div style={ui.knobLabel}>{label}</div>
+      {hint && <div style={ui.hint}>{hint}</div>}
     </div>
   );
 }
@@ -404,233 +404,318 @@ function BigKnob({ label, value, onChange }) {
   const [drag, setDrag] = useState(null);
   const angle = -135 + value * 270;
   return (
-    <div style={styles.bigKnobBlock}>
+    <div style={ui.bigKnobBlock}>
       <div
-        style={{
-          ...styles.bigKnob,
-          transform: `rotate(${angle}deg)`,
-        }}
-        onPointerDown={(e) => { e.currentTarget.setPointerCapture(e.pointerId); setDrag({ startX: e.clientX, startY: e.clientY, start: value }); }}
+        style={{ ...ui.bigKnob, transform: `rotate(${angle}deg)` }}
+        onPointerDown={(e) => { e.currentTarget.setPointerCapture(e.pointerId); setDrag({ x: e.clientX, y: e.clientY, v: value }); }}
         onPointerMove={(e) => {
           if (!drag) return;
-          const dy = (drag.startY - e.clientY) / 300;
-          const dx = (e.clientX - drag.startX) / 300;
-          onChange(drag.start + dy + dx * 0.2); // un peu horizontal
+          const dy = (drag.y - e.clientY) / 340;
+          const dx = (e.clientX - drag.x) / 420;
+          onChange(drag.v + dy + dx * 0.25);
         }}
         onPointerUp={() => setDrag(null)}
         onPointerCancel={() => setDrag(null)}
       >
-        <div style={styles.bigKnobIndicator} />
+        <div style={ui.bigKnobIndicator} />
       </div>
-      <div style={styles.knobLabel}>{label}</div>
+      <div style={ui.knobLabel}>{label}</div>
     </div>
   );
 }
 
 function ToggleSwitch({ label, on, onChange }) {
   return (
-    <div style={styles.switchBlock} onClick={() => onChange(!on)}>
-      <div style={styles.switchLabel}>{label}</div>
-      <div style={{ ...styles.switch, background: on ? "#6ccf7a" : "#444654" }}>
-        <div style={{ ...styles.switchDot, transform: `translateX(${on ? 20 : 0}px)` }} />
+    <div style={ui.switchBlock} onClick={() => onChange(!on)}>
+      <div style={ui.switchLabel}>{label}</div>
+      <div style={{ ...ui.switch, background: on ? "#6ad27a" : "#464a58" }}>
+        <div style={{ ...ui.switchDot, transform: `translateX(${on ? 20 : 0}px)` }} />
       </div>
     </div>
   );
 }
 
 function Button({ label, onClick, color = "#5b4dd6" }) {
-  return (
-    <button onClick={onClick} style={{ ...styles.button, background: color }}>{label}</button>
-  );
+  return <button onClick={onClick} style={{ ...ui.button, background: color }}>{label}</button>;
 }
 
 function Lamp({ label, on, colorOn = "#86fb6a" }) {
   return (
-    <div style={styles.lamp}>
-      <div style={{ ...styles.lampDot, background: on ? colorOn : "#222" }} />
-      <div style={styles.lampLabel}>{label}</div>
+    <div style={ui.lamp}>
+      <div style={{ ...ui.lampDot, background: on ? colorOn : "#191c24", boxShadow: on ? "0 0 12px rgba(134,251,106,0.6)" : "none" }} />
+      <div style={ui.lampLabel}>{label}</div>
     </div>
   );
 }
 
 function MiniDial({ label, min, max, step, value, setValue }) {
   return (
-    <div style={styles.miniDial}>
-      <div style={styles.miniLabel}>{label}</div>
-      <input
-        type="range"
-        min={min} max={max} step={step}
-        value={value}
-        onChange={(e) => setValue(Number(e.target.value))}
-        style={{ width: "100%" }}
-      />
-      <div style={styles.miniVal}>{Math.round(value)}</div>
+    <div style={ui.miniDial}>
+      <div style={ui.miniLabel}>{label}</div>
+      <input type="range" min={min} max={max} step={step} value={value} onChange={(e) => setValue(Number(e.target.value))} style={{ width: "100%" }} />
+      <div style={ui.miniVal}>{Math.round(value)}</div>
     </div>
   );
 }
 
-// ————————————————————— Styles —————————————————————
+function VuMeter({ label, value }) {
+  const pct = Math.round(clamp01(value) * 100);
+  const color =
+    pct < 60 ? "#7bdc8b" :
+    pct < 85 ? "#f0c14b" :
+    "#ff6a6a";
+  return (
+    <div style={vu.box}>
+      <div style={vu.scale}>
+        <div style={{ ...vu.bar, width: `${pct}%`, background: color }} />
+      </div>
+      <div style={vu.label}>{label}</div>
+    </div>
+  );
+  function clamp01(x) { return Math.max(0, Math.min(1, x)); }
+}
+
+function Screw({ at }) {
+  const pos = {
+    tl: { top: -8, left: -8 },
+    tr: { top: -8, right: -8 },
+    bl: { bottom: -8, left: -8 },
+    br: { bottom: -8, right: -8 }
+  }[at];
+  return <div style={{ ...decor.screw, ...pos }} />;
+}
+
+/* —————————————— Styles —————————————— */
 
 const styles = {
   page: {
     minHeight: "100vh",
-    background: "radial-gradient(1200px 600px at 50% -200px, #1c1a22, #0b0b10 60%)",
+    background:
+      "radial-gradient(1600px 700px at 50% -200px, #1a1920, #0b0b10 60%)",
     display: "grid",
     placeItems: "center",
     padding: 24
   },
-  radioBox: {
-    width: "min(980px, 96vw)",
-    borderRadius: 22,
-    padding: 18,
-    border: "1px solid #2b2b36",
-    boxShadow: "0 18px 60px rgba(0,0,0,0.55)",
-    background: "linear-gradient(180deg,#3a2f27,#2c231d)",
-    position: "relative"
+  shadowWrap: { position: "relative" },
+  cabinet: {
+    width: "min(980px, 94vw)",
+    borderRadius: 26,
+    padding: 16,
+    border: "1px solid rgba(30,20,10,0.6)",
+    boxShadow:
+      "0 28px 80px rgba(0,0,0,0.65), inset 0 0 0 1px rgba(255,255,255,0.03)",
+    background:
+      // bois texturé
+      "linear-gradient(180deg,#4b3425,#3c2a1f 40%,#34241b 100%), " +
+      "repeating-linear-gradient(45deg, rgba(255,255,255,0.05) 0 1px, rgba(0,0,0,0.06) 1px 2px)",
+    position: "relative",
+    overflow: "hidden"
   },
-  brandRow: {
+
+  headerBar: {
     display: "flex",
     alignItems: "center",
     justifyContent: "space-between",
+    marginBottom: 12
+  },
+  brandPlate: {
+    background: "linear-gradient(180deg,#2a2b30,#1b1c23)",
+    color: "#e8e3d6",
+    borderRadius: 10,
+    border: "1px solid #2a2c36",
+    padding: "8px 12px",
+    boxShadow: "inset 0 0 18px rgba(0,0,0,0.45)"
+  },
+  brandText: { fontWeight: 800, letterSpacing: 2, fontSize: 13 },
+  brandSub: { fontSize: 11, opacity: 0.75 },
+  lampsRow: { display: "flex", gap: 14, alignItems: "center" },
+
+  glass: {
+    borderRadius: 16,
+    border: "1px solid #2b2e3a",
+    background:
+      "linear-gradient(180deg, rgba(16,18,26,0.95), rgba(10,12,18,0.95)), " +
+      "radial-gradient(800px 200px at 50% -80px, rgba(255,255,255,0.06), transparent 60%)",
+    padding: 12,
+    position: "relative",
+    overflow: "hidden",
+    boxShadow: "inset 0 0 28px rgba(0,0,0,0.5)"
+  },
+  scaleWrap: {
+    position: "relative",
+    height: 54,
+    borderRadius: 10,
+    border: "1px solid #252834",
+    background: "#0d0f15",
+    overflow: "hidden",
     marginBottom: 8
   },
-  brand: {
-    color: "#f0e7d1",
-    letterSpacing: 2,
-    fontWeight: 700,
-    fontSize: 14
-  },
-  lamps: { display: "flex", gap: 12, alignItems: "center" },
-
-  display: {
-    background: "linear-gradient(180deg,#0d0f16,#07080d)",
-    border: "1px solid #232533",
-    borderRadius: 14,
-    padding: "12px 14px",
-    color: "#eae7f5",
-    boxShadow: "inset 0 0 30px rgba(0,0,0,0.45)"
-  },
-  scale: {
-    height: 32,
-    position: "relative",
-    background: "repeating-linear-gradient(90deg, rgba(255,255,255,0.08) 0px, rgba(255,255,255,0.08) 2px, transparent 2px, transparent 8px)",
-    borderRadius: 8,
-    marginBottom: 8,
-    overflow: "hidden"
+  scaleGrid: {
+    position: "absolute",
+    inset: 0,
+    background:
+      "repeating-linear-gradient(90deg, rgba(255,255,255,0.08) 0 2px, transparent 2px 12px)"
   },
   tick: {
-    position: "absolute",
-    top: 0,
-    width: 2,
-    height: "100%",
-    background: "rgba(255,255,255,0.35)",
-    transform: "translateX(-1px)"
+    position: "absolute", top: 0, width: 2, height: "100%",
+    background: "rgba(240,210,140,0.7)", transform: "translateX(-1px)"
   },
   needle: {
-    position: "absolute",
-    top: 0,
-    width: 2,
-    height: "100%",
+    position: "absolute", top: 0, width: 2, height: "100%",
     background: "#f05a6e",
-    boxShadow: "0 0 8px rgba(240,90,110,0.6)",
+    boxShadow: "0 0 10px rgba(240,90,110,0.7), 0 0 20px rgba(240,90,110,0.35)",
     transform: "translateX(-1px)"
   },
-  stationText: { fontSize: 13, opacity: 0.9 },
-
-  grille: {
-    marginTop: 12,
-    height: 90,
-    borderRadius: 12,
-    border: "1px solid #2b2b36",
+  stationRow: {
+    display: "flex", justifyContent: "space-between",
+    color: "#eae7f5", fontSize: 13, padding: "0 2px"
+  },
+  scratches: {
+    position: "absolute", inset: 0, pointerEvents: "none",
     background:
-      "radial-gradient(circle at 20% 50%, rgba(0,0,0,0.4), transparent 60%), " +
-      "repeating-linear-gradient(45deg, #1c1e27 0, #1c1e27 3px, #151722 3px, #151722 6px)"
+      "linear-gradient(transparent, rgba(255,255,255,0.03) 20%, transparent 60%), " +
+      "repeating-linear-gradient(120deg, rgba(255,255,255,0.03) 0 1px, transparent 1px 4px)"
+  },
+
+  speakerSection: {
+    marginTop: 12,
+    display: "grid",
+    gridTemplateColumns: "2fr 1fr",
+    gap: 12
+  },
+  grill: {
+    borderRadius: 14,
+    border: "1px solid #282a32",
+    height: 120,
+    background:
+      "radial-gradient(circle at 30% 30%, rgba(0,0,0,0.3), transparent 65%), " +
+      "repeating-linear-gradient(45deg, #1a1d27 0 6px, #131521 6px 12px)"
+  },
+  vuWrap: {
+    borderRadius: 14,
+    border: "1px solid #282a32",
+    height: 120,
+    padding: 12,
+    background:
+      "linear-gradient(180deg,#12141c,#0e1017)",
+    display: "grid",
+    gridTemplateRows: "1fr 1fr",
+    gap: 10
   },
 
   controlsRow: {
+    marginTop: 14,
     display: "grid",
-    gridTemplateColumns: "1.1fr 1fr 1.1fr",
-    gap: 16,
-    marginTop: 16
+    gridTemplateColumns: "1.05fr 1fr 1.05fr",
+    gap: 14
   },
-
-  leftColumn: {
-    display: "grid",
-    gridTemplateRows: "auto auto auto auto",
-    gap: 10,
-    alignContent: "start"
+  colLeft: {
+    display: "grid", gridTemplateRows: "auto auto auto auto", gap: 10, alignContent: "start"
   },
-  centerColumn: {
+  colCenter: {
     display: "grid",
     gridTemplateColumns: "1fr 1fr",
-    gap: 16,
+    gap: 14,
     alignItems: "center",
     justifyItems: "center"
   },
-  rightColumn: {
-    display: "grid",
-    gridTemplateRows: "auto auto",
-    gap: 6,
-    alignContent: "start",
-    justifyItems: "center"
+  colRight: {
+    display: "grid", gridTemplateRows: "auto auto", gap: 10, justifyItems: "center", alignContent: "start"
   },
+  subDials: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, alignItems: "center" }
+};
 
-  // Knobs
+const ui = {
   knobBlock: { display: "grid", justifyItems: "center" },
   knob: {
-    width: 84, height: 84, borderRadius: "50%",
-    background:
-      "radial-gradient(circle at 30% 30%, #444, #262b34 60%, #141821 100%)",
-    border: "1px solid #222834",
-    boxShadow: "inset 0 8px 24px rgba(0,0,0,0.55), 0 6px 18px rgba(0,0,0,0.35)",
-    display: "grid", placeItems: "center", transition: "transform 0.05s linear",
-    touchAction: "none", userSelect: "none", cursor: "grab"
+    width: 86, height: 86, borderRadius: "50%",
+    background: "radial-gradient(circle at 30% 30%, #4d505a, #2a2f3a 60%, #141821 100%)",
+    border: "1px solid #1e2430",
+    boxShadow: "inset 0 10px 26px rgba(0,0,0,0.6), 0 8px 24px rgba(0,0,0,0.45)",
+    display: "grid", placeItems: "center",
+    touchAction: "none", userSelect: "none", cursor: "grab",
+    transition: "transform .05s linear"
   },
   knobIndicator: {
-    width: 6, height: 28, borderRadius: 3, background: "#eae7f5",
-    boxShadow: "0 0 8px rgba(255,255,255,0.35)"
+    width: 6, height: 26, borderRadius: 3, background: "#f6d8a8",
+    boxShadow: "0 0 8px rgba(246,216,168,0.4)"
   },
   knobLabel: { color: "#f0e7d1", marginTop: 6, fontSize: 12, letterSpacing: 1.2 },
   hint: { color: "rgba(255,255,255,0.65)", fontSize: 11, marginTop: 2 },
 
   bigKnobBlock: { display: "grid", justifyItems: "center" },
   bigKnob: {
-    width: 140, height: 140, borderRadius: "50%",
-    background:
-      "radial-gradient(circle at 30% 30%, #51535c, #2a2f3a 60%, #141821 100%)",
-    border: "1px solid #222834",
-    boxShadow: "inset 0 10px 28px rgba(0,0,0,0.6), 0 8px 22px rgba(0,0,0,0.45)",
-    display: "grid", placeItems: "center", transition: "transform 0.05s linear",
+    width: 148, height: 148, borderRadius: "50%",
+    background: "radial-gradient(circle at 30% 30%, #5a5e68, #2a2f3a 60%, #141821 100%)",
+    border: "1px solid #1e2430",
+    boxShadow: "inset 0 12px 30px rgba(0,0,0,0.62), 0 10px 28px rgba(0,0,0,0.5)",
+    display: "grid", placeItems: "center",
     touchAction: "none", userSelect: "none", cursor: "grab"
   },
   bigKnobIndicator: {
     width: 8, height: 34, borderRadius: 4, background: "#ffd28c",
-    boxShadow: "0 0 10px rgba(255,210,140,0.5)"
+    boxShadow: "0 0 12px rgba(255,210,140,0.55)"
   },
 
-  // Switch
   switchBlock: { display: "grid", gridTemplateColumns: "auto 1fr", alignItems: "center", gap: 10 },
   switchLabel: { color: "#f0e7d1", fontSize: 12, letterSpacing: 1.2 },
   switch: { width: 44, height: 20, borderRadius: 12, position: "relative", border: "1px solid #2b2b36" },
-  switchDot: {
-    width: 18, height: 18, borderRadius: "50%", background: "#0b0b10",
-    border: "1px solid #2b2b36", position: "absolute", top: 1, left: 1, transition: "transform .15s"
-  },
+  switchDot: { width: 18, height: 18, borderRadius: "50%", background: "#0b0b10", border: "1px solid #2b2b36", position: "absolute", top: 1, left: 1, transition: "transform .15s" },
 
-  // Buttons
   button: {
     cursor: "pointer",
     border: "1px solid #2b2b36",
     borderRadius: 12,
     padding: "10px 14px",
-    fontWeight: 700,
+    fontWeight: 800,
     fontSize: 13,
     color: "#0b0b10",
     boxShadow: "0 6px 18px rgba(0,0,0,0.35)"
   },
 
-  // Lamps
   lamp: { display: "grid", gridTemplateColumns: "auto auto", gap: 6, alignItems: "center" },
-  lampDot: { width: 12, height: 12, borderRadius: "50%", boxShadow: "0 0 8px rgba(0,0,0,0.4)" },
-  lampLabel: { color: "#cfc8b0", fontSize: 11, letterSpacing: 1 }
+  lampDot: { width: 12, height: 12, borderRadius: "50%" },
+  lampLabel: { color: "#e0d8c0", fontSize: 11, letterSpacing: 1 },
+
+  miniDial: { display: "grid", gridTemplateRows: "auto auto auto", gap: 4, alignItems: "center" },
+  miniLabel: { color: "#f0e7d1", fontSize: 11, letterSpacing: 1.2, textAlign: "center" },
+  miniVal: { color: "rgba(255,255,255,0.8)", fontSize: 11, textAlign: "center" }
+};
+
+const vu = {
+  box: {
+    background: "linear-gradient(180deg,#171923,#0f121a)",
+    border: "1px solid #262a36",
+    borderRadius: 10,
+    padding: 8,
+    boxShadow: "inset 0 0 22px rgba(0,0,0,0.5)",
+    display: "grid",
+    gridTemplateRows: "1fr auto",
+    gap: 6
+  },
+  scale: {
+    height: 12,
+    borderRadius: 8,
+    background: "linear-gradient(180deg,#0b0e15,#0a0c12)",
+    border: "1px solid #242837",
+    overflow: "hidden",
+    position: "relative"
+  },
+  bar: {
+    position: "absolute", top: 0, left: 0, bottom: 0,
+    background: "#7bdc8b", transition: "width 60ms linear"
+  },
+  label: { color: "#cfc8b0", fontSize: 10, textAlign: "right", opacity: 0.85 }
+};
+
+const decor = {
+  screw: {
+    position: "absolute",
+    width: 18, height: 18,
+    borderRadius: "50%",
+    background:
+      "radial-gradient(circle at 30% 30%, #9aa0ad, #4b515e 60%, #1e232d)",
+    border: "1px solid #222834",
+    boxShadow: "0 8px 20px rgba(0,0,0,0.5), inset 0 3px 8px rgba(0,0,0,0.6)"
+  }
 };
