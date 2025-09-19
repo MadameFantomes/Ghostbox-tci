@@ -44,9 +44,6 @@
     { "name": "SomaFM – Digitalis", "url": "https://ice5.somafm.com/digitalis-128-mp3" },
     { "name": "SomaFM – Fluid", "url": "https://ice5.somafm.com/fluid-128-mp3" },
 
-    { "name": "KEXP (160k AAC)", "url": "https://kexp.streamguys1.com/kexp160.aac" },
-    { "name": "KEXP (64k AAC)", "url": "https://kexp.streamguys1.com/kexp64.aac" },
-
     { "name": "Radio Paradise (AAC 320)", "url": "https://stream.radioparadise.com/aac-320" },
     { "name": "Radio Paradise (MP3 192)", "url": "https://stream.radioparadise.com/mp3-192" },
 
