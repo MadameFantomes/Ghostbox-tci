@@ -2,11 +2,12 @@
 
 /**
  * Ghostbox TCI — FR
- * - Bruit de fond très discret (loin derrière la radio)
- * - Burst de balayage adouci/plafonné
- * - Ducking auto : quand la radio joue, le bruit retombe au plancher
+ * - Balayage "direct" : ne garde que des flux directs (MP3/AAC/OGG), exclut playlists/HLS
+ *   et force le live-edge avec un paramètre anti-cache à chaque changement.
+ * - Aucun compteur de stations affiché
+ * - Bruit de fond très discret + ducking auto quand la radio joue
  * - ENREGISTRER (.webm), Balayage AUTO + skip flux HS (timeout)
- * - Filtre radio “TCI” auto (si WebAudio autorisé), pas d’affichage du nombre de stations
+ * - Filtre radio “TCI” auto (si WebAudio autorisé)
  * - Charge /public/stations.json sinon fallback
  */
 
@@ -14,7 +15,7 @@ import React, { useEffect, useRef, useState } from "react";
 
 const AUTO_FILTER = true;
 
-// ------- Fallback -------
+// ------- Fallback (flux directs HTTPS) -------
 const FALLBACK_STATIONS = [
   "https://icecast.radiofrance.fr/fip-midfi.mp3",
   "https://icecast.radiofrance.fr/fiprock-midfi.mp3",
@@ -86,9 +87,9 @@ export default function Page() {
   // Helpers
   const clamp01 = (x) => Math.max(0, Math.min(1, x));
   const msFromSpeed = (v) => Math.round(250 + v * (2500 - 250)); // 250..2500
-  const BASE_NOISE = 0.006;                 // << bruit de fond très faible
+  const BASE_NOISE = 0.006;                 // bruit de fond très faible
   const burstMs  = () => Math.round(120 + debit * 520); // 120..640 ms
-  const burstGain = () => Math.min(0.40, 0.08 + debit * 0.32); // plafonné à ~0.40
+  const burstGain = () => Math.min(0.40, 0.08 + debit * 0.32); // intensité plafonnée
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
   // ------- Charger /stations.json -------
@@ -103,11 +104,13 @@ export default function Page() {
     })();
   }, []);
 
+  // Déplie/stérilise la structure JSON et NE GARDE QUE des flux "directs"
   function normalizeStationsJson(json) {
     let list = [];
     const push = (name, url, suffix="") => {
       if (!url || typeof url !== "string") return;
       if (!/^https:/i.test(url)) return;
+      if (!isDirectStreamURL(url)) return; // <-- direct only (pas HLS/playlist)
       try { url = url.trim(); list.push({ name: (name && name.trim()) || new URL(url).host + suffix, url }); } catch {}
     };
     if (Array.isArray(json)) {
@@ -121,6 +124,23 @@ export default function Page() {
     list = list.filter(s => (seen.has(s.url) ? false : seen.add(s.url)));
     for (let i=list.length-1;i>0;i--){const j=Math.floor(Math.random()*(i+1));[list[i],list[j]]=[list[j],list[i]];}
     return list;
+  }
+
+  // --- Helpers "live" ---
+  function isDirectStreamURL(u) {
+    try {
+      const url = u.toLowerCase();
+      if (/\.(m3u8|m3u|pls|xspf)(\?|$)/.test(url)) return false; // exclut HLS/playlists
+      if (/\.(mp3|aac|m4a|ogg|opus)(\?|$)/.test(url)) return true; // extensions directes
+      // patterns Icecast/SHOUTcast courants ("/mp3", "/aac", "/stream/")
+      if (url.includes("/mp3") || url.includes("/aac") || url.includes("/stream/")) return true;
+      if (url.includes("icecast") || url.includes("shoutcast")) return true;
+      return false;
+    } catch { return false; }
+  }
+  function withCacheBust(url) {
+    const sep = url.includes("?") ? "&" : "?";
+    return `${url}${sep}ghostbox_live=${Date.now()}`;
   }
 
   // ------- Init WebAudio -------
@@ -144,11 +164,11 @@ export default function Page() {
     const noise = createNoiseNode(ctx); noiseNodeRef.current = noise;
     const hpN = ctx.createBiquadFilter(); hpN.type = "highpass"; hpN.frequency.value = 160; hpN.Q.value = 0.7;
     const bp  = ctx.createBiquadFilter(); bp.type = "bandpass"; bp.Q.value = 0.55; bp.frequency.value = 1800;
-    const lpN = ctx.createBiquadFilter(); lpN.type = "lowpass";  lpN.frequency.value = 5200; lpN.Q.value = 0.3; // un peu plus sombre
+    const lpN = ctx.createBiquadFilter(); lpN.type = "lowpass";  lpN.frequency.value = 5200; lpN.Q.value = 0.3; // un peu sombre
     noiseHPRef.current = hpN; noiseFilterRef.current = bp; noiseLPRef.current = lpN;
     const gNoise = ctx.createGain(); gNoise.gain.value = 0; noiseGainRef.current = gNoise;
 
-    // Radio auto-filtre
+    // Radio auto-filtre “TCI”
     const hp = ctx.createBiquadFilter();  hp.type = "highpass"; hp.frequency.value = 320; hp.Q.value = 0.7;
     const lp = ctx.createBiquadFilter();  lp.type = "lowpass";  lp.frequency.value = 3400; lp.Q.value = 0.7;
     const shelf = ctx.createBiquadFilter(); shelf.type = "highshelf"; shelf.frequency.value = 2500; shelf.gain.value = -4;
@@ -171,7 +191,7 @@ export default function Page() {
     const sum = ctx.createGain(); sum.gain.value = 1;
     // bruit : noise → HP → BP → LP → gNoise → sum
     noise.connect(hpN); hpN.connect(bp); bp.connect(lpN); lpN.connect(gNoise); gNoise.connect(sum);
-    // radio branchée plus tard (attachMedia) → gRadio → sum
+    // radio (branche via attachMedia → gRadio), puis :
     gRadio.connect(sum);
 
     sum.connect(dry);  dry.connect(master);
@@ -202,9 +222,9 @@ export default function Page() {
     const ctx = ctxRef.current; if (!AUTO_FILTER || !ctx || !radioHPRef.current) return;
     const now = ctx.currentTime;
     const hpF = 260 + Math.random() * 160;      // 260..420 Hz
-    const lpF = 2800 + Math.random() * 1400;    // 2.8..4.2 kHz (un poil plus sombre)
+    const lpF = 2800 + Math.random() * 1400;    // 2.8..4.2 kHz
     const shelfGain = -(2 + Math.random() * 5); // -2..-7 dB
-    const driveAmt = 0.16 + Math.random() * 0.12; // un peu moins de drive
+    const driveAmt = 0.16 + Math.random() * 0.12;
     try {
       radioHPRef.current.frequency.setTargetAtTime(hpF, now, 0.08);
       radioLPRef.current.frequency.setTargetAtTime(lpF, now, 0.08);
@@ -292,9 +312,9 @@ export default function Page() {
     const bp = noiseFilterRef.current, hp = noiseHPRef.current, lp = noiseLPRef.current;
     const g = noiseGainRef.current?.gain;
 
-    // couleur selon DÉBIT (encore adoucie)
+    // couleur selon DÉBIT (douce)
     const q   = 0.35 + debit * 0.45;    // 0.35..0.80
-    const lpF = 4200 + debit * 1600;    // 4.2..5.8 kHz (plus sombre)
+    const lpF = 4200 + debit * 1600;    // 4.2..5.8 kHz (sombre)
     const hpF = 160  + debit * 180;     // 160..340 Hz
     try {
       bp.Q.setTargetAtTime(q, now, 0.05);
@@ -363,10 +383,18 @@ export default function Page() {
 
     await sleep(Math.max(100, dur * 600));
 
-    // 2) charger / jouer
+    // 2) charger / jouer en forçant le live-edge
     try {
       el.crossOrigin = "anonymous";
-      el.pause(); el.src = url; el.load();
+      el.pause();
+      el.src = withCacheBust(url); // << force un nouveau point au direct
+      el.load();
+
+      // optionnel : indiquer si ça tamponne (le timeout fera sauter au besoin)
+      const onStall = () => setEtat("buffering…");
+      el.addEventListener("waiting", onStall, { once: true });
+      el.addEventListener("stalled", onStall, { once: true });
+
       const playP = el.play();
       const timeout = new Promise((_, rej) => setTimeout(() => rej(new Error("timeout")), 3500));
       await Promise.race([playP, timeout]);
@@ -510,7 +538,7 @@ export default function Page() {
       </div>
 
       <p style={{ color: "rgba(255,255,255,0.8)", marginTop: 10, fontSize: 12 }}>
-        Si le bruit te gêne encore, baisse <strong>DÉBIT</strong> (0.2–0.4). Le burst reste court et la radio passe devant.
+        Seules les sources “directes” sont balayées. Si une station tarde, on saute automatiquement.
       </p>
     </main>
   );
