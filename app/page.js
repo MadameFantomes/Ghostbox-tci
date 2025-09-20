@@ -1,13 +1,14 @@
 "use client";
 
 /**
- * Ghostbox TCI — FR (refonte propre)
- * - Bruit de fond très discret (loin derrière la radio)
- * - Burst de balayage adouci/plafonné
- * - Ducking auto : quand la radio joue, le bruit retombe au plancher
+ * Ghostbox TCI — FR (clean build)
+ * - Bruit de fond discret
+ * - Burst de balayage adouci + plafonné
+ * - Ducking auto du bruit quand la radio joue
  * - ENREGISTRER (.webm), Balayage AUTO + skip flux HS (timeout)
- * - Filtre radio “TCI” auto (si WebAudio autorisé), pas d’affichage du nombre de stations
+ * - Filtre radio “TCI” auto si WebAudio autorisé (compat sinon)
  * - Charge /public/stations.json sinon fallback
+ * - LOG minimal : localStorage("ghostbox.logs") + BroadcastChannel("labo-ghostbox")
  */
 
 import React, { useEffect, useRef, useState } from "react";
@@ -79,10 +80,6 @@ export default function Page() {
   const sweepTimerRef = useRef(null);
   const playingLockRef = useRef(false);
 
-  // --- LOG minimal (carnet de labo) ---
-  const logRef = useRef([]);
-  const bcRef = useRef(null);
-
   // Contrôles
   const [vitesse, setVitesse] = useState(0.45); // 250..2500 ms
   const [volume, setVolume] = useState(0.9);
@@ -94,53 +91,70 @@ export default function Page() {
   const recRef = useRef(null);
   const chunksRef = useRef([]);
 
+  // ------- LOG minimal -------
+  const logRef = useRef([]);
+  const bcRef = useRef(null); // BroadcastChannel
+
   // Helpers
   const clamp01 = (x) => Math.max(0, Math.min(1, x));
   const msFromSpeed = (v) => Math.round(250 + v * (2500 - 250)); // 250..2500
-  const BASE_NOISE = 0.006; // << bruit de fond très faible
+  const BASE_NOISE = 0.006; // bruit de fond très faible
   const burstMs = () => Math.round(120 + debit * 520); // 120..640 ms
   const burstGain = () => Math.min(0.4, 0.08 + debit * 0.32); // plafonné à ~0.40
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-  // ------- LOG : BroadcastChannel + helpers -------
+  // ------- LOG setup -------
   useEffect(() => {
-    try { bcRef.current = new BroadcastChannel("labo-ghostbox"); } catch {}
-    return () => { try { bcRef.current?.close(); } catch {} };
+    try {
+      bcRef.current = new BroadcastChannel("labo-ghostbox");
+    } catch {}
+    return () => {
+      try {
+        bcRef.current?.close();
+      } catch {}
+    };
   }, []);
 
   function addLog(event, extra = {}) {
     const entry = {
       timestamp: new Date().toISOString(),
       event,
-      vitesse, volume, debit, echo,
+      vitesse,
+      volume,
+      debit,
+      echo,
       station: stationsRef.current[idxRef.current]?.name || null,
       ...extra,
     };
     logRef.current.push(entry);
-    // localStorage append
     try {
       const key = "ghostbox.logs";
       const prev = JSON.parse(localStorage.getItem(key) || "[]");
       prev.push(entry);
       localStorage.setItem(key, JSON.stringify(prev));
     } catch {}
-    // diffusion temps réel au carnet (onglet abonné)
-    try { bcRef.current?.postMessage(entry); } catch {}
+    try {
+      bcRef.current?.postMessage(entry);
+    } catch {}
   }
 
   function exportLog() {
     try {
-      const blob = new Blob([JSON.stringify(logRef.current, null, 2)], { type: "application/json" });
+      const blob = new Blob([JSON.stringify(logRef.current, null, 2)], {
+        type: "application/json",
+      });
       const url = URL.createObjectURL(blob);
       const a = document.createElement("a");
       a.href = url;
-      a.download = `ghostbox-log-${new Date().toISOString().replace(/[:.]/g, "-")}.json`;
+      a.download = `ghostbox-log-${new Date()
+        .toISOString()
+        .replace(/[:.]/g, "-")}.json`;
       document.body.appendChild(a);
       a.click();
       document.body.removeChild(a);
       URL.revokeObjectURL(url);
     } catch {}
-  }((r) => setTimeout(r, ms));
+  }
 
   // ------- Charger /stations.json -------
   useEffect(() => {
@@ -159,6 +173,7 @@ export default function Page() {
         stationsRef.current = FALLBACK_STATIONS;
       }
     })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   function normalizeStationsJson(json) {
@@ -168,7 +183,10 @@ export default function Page() {
       if (!/^https:/i.test(url)) return; // https only
       try {
         url = url.trim();
-        list.push({ name: (name && name.trim()) || safeHost(url) + suffix, url });
+        list.push({
+          name: (name && name.trim()) || safeHost(url) + suffix,
+          url,
+        });
       } catch {}
     };
 
@@ -176,20 +194,22 @@ export default function Page() {
       json.forEach((s) => {
         if (!s) return;
         if (s.url) push(s.name, s.url);
-        if (Array.isArray(s.urls)) s.urls.forEach((u, k) => push(s.name, u, ` #${k + 1}`));
+        if (Array.isArray(s.urls))
+          s.urls.forEach((u, k) => push(s.name, u, ` #${k + 1}`));
       });
     } else if (json && typeof json === "object") {
-      Object.entries(json).forEach(([group, arr]) =>
-        Array.isArray(arr) &&
-          arr.forEach((s) => {
-            if (!s) return;
-            if (s.url) push(s.name || group, s.url);
-            if (Array.isArray(s.urls)) s.urls.forEach((u, k) => push(s.name || group, u, ` #${k + 1}`));
-          })
-      );
+      Object.entries(json).forEach(([group, arr]) => {
+        if (!Array.isArray(arr)) return;
+        arr.forEach((s) => {
+          if (!s) return;
+          if (s.url) push(s.name || group, s.url);
+          if (Array.isArray(s.urls))
+            s.urls.forEach((u, k) => push(s.name || group, u, ` #${k + 1}`));
+        });
+      });
     }
 
-    // Uniques + shuffle léger
+    // Uniques + shuffle léger (tu peux commenter pour respecter l'ordre)
     const seen = new Set();
     list = list.filter((s) => (seen.has(s.url) ? false : seen.add(s.url)));
     for (let i = list.length - 1; i > 0; i--) {
@@ -308,7 +328,7 @@ export default function Page() {
     lpN.connect(gNoise);
     gNoise.connect(sum);
 
-    // radio branchée plus tard (attachMedia) → gRadio → sum
+    // radio → gRadio → sum
     gRadio.connect(sum);
 
     sum.connect(dry);
@@ -357,9 +377,9 @@ export default function Page() {
     if (!AUTO_FILTER || !ctx || !radioHPRef.current) return;
     const now = ctx.currentTime;
     const hpF = 260 + Math.random() * 160; // 260..420 Hz
-    const lpF = 2800 + Math.random() * 1400; // 2.8..4.2 kHz (un poil plus sombre)
+    const lpF = 2800 + Math.random() * 1400; // 2.8..4.2 kHz
     const shelfGain = -(2 + Math.random() * 5); // -2..-7 dB
-    const driveAmt = 0.16 + Math.random() * 0.12; // un peu moins de drive
+    const driveAmt = 0.16 + Math.random() * 0.12;
     try {
       radioHPRef.current.frequency.setTargetAtTime(hpF, now, 0.08);
       radioLPRef.current.frequency.setTargetAtTime(lpF, now, 0.08);
@@ -386,7 +406,7 @@ export default function Page() {
         src.connect(radioGainRef.current);
       }
 
-      // --- Ducking auto du bruit quand la radio joue ---
+      // ducking du bruit quand la radio joue
       const el = audioElRef.current;
       const duckToFloor = () => {
         const now = ctxRef.current.currentTime;
@@ -398,13 +418,11 @@ export default function Page() {
       el.addEventListener("playing", duckToFloor);
       el.addEventListener("timeupdate", duckToFloor);
 
-      // cleanup au démontage
-      const cleanup = () => {
+      // cleanup pour powerOff
+      attachMedia._cleanup = () => {
         el.removeEventListener("playing", duckToFloor);
         el.removeEventListener("timeupdate", duckToFloor);
       };
-      // on colle sur ref pour que powerOff puisse l'appeler si besoin
-      attachMedia._cleanup = cleanup;
 
       setCompat(false);
     } catch {
@@ -417,11 +435,10 @@ export default function Page() {
     await initAudio();
     const ctx = ctxRef.current;
     if (ctx.state === "suspended") await ctx.resume();
-    try { noiseGainRef.current.gain.value = BASE_NOISE; } catch {}
+    try {
+      noiseGainRef.current.gain.value = BASE_NOISE;
+    } catch (e) {}
     addLog("power_on");
-    await playIndex(idxRef.current);
-    setMarche(true);
-  } catch {}
     await playIndex(idxRef.current);
     setMarche(true);
   }
@@ -429,11 +446,25 @@ export default function Page() {
   async function powerOff() {
     stopSweep();
     const el = audioElRef.current;
-    try { noiseGainRef.current.gain.value = 0; } catch {}
-    if (el) { el.pause(); el.src = ""; el.load(); }
+    try {
+      noiseGainRef.current.gain.value = 0;
+    } catch {}
+    if (el) {
+      el.pause();
+      el.src = "";
+      el.load();
+    }
     if (attachMedia._cleanup) attachMedia._cleanup();
-    if (enr) { try { recRef.current?.stop(); } catch {}; setEnr(false); }
-    try { await ctxRef.current?.suspend(); } catch {}
+
+    if (enr) {
+      try {
+        recRef.current?.stop();
+      } catch {}
+      setEnr(false);
+    }
+    try {
+      await ctxRef.current?.suspend();
+    } catch {}
     setMarche(false);
     setAuto(false);
     setEtat("arrêté");
@@ -446,9 +477,14 @@ export default function Page() {
     const ctx = ctxRef.current;
     if (!ctx || !clickBusRef.current) return;
     const dur = 0.012;
-    const buf = ctx.createBuffer(1, Math.max(1, Math.floor(dur * ctx.sampleRate)), ctx.sampleRate);
+    const buf = ctx.createBuffer(
+      1,
+      Math.max(1, Math.floor(dur * ctx.sampleRate)),
+      ctx.sampleRate
+    );
     const d = buf.getChannelData(0);
-    for (let i = 0; i < d.length; i++) d[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / d.length, 12);
+    for (let i = 0; i < d.length; i++)
+      d[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / d.length, 12);
     const src = ctx.createBufferSource();
     src.buffer = buf;
     const g = clickBusRef.current;
@@ -472,9 +508,9 @@ export default function Page() {
       lp = noiseLPRef.current;
     const g = noiseGainRef.current?.gain;
 
-    // couleur selon DÉBIT (encore adoucie)
+    // couleur selon DÉBIT
     const q = 0.35 + debit * 0.45; // 0.35..0.80
-    const lpF = 4200 + debit * 1600; // 4.2..5.8 kHz (plus sombre)
+    const lpF = 4200 + debit * 1600; // 4.2..5.8 kHz
     const hpF = 160 + debit * 180; // 160..340 Hz
     try {
       bp.Q.setTargetAtTime(q, now, 0.05);
@@ -490,7 +526,10 @@ export default function Page() {
     for (let i = 0; i <= steps; i++) {
       const t = now + (durSec * i) / steps;
       const x = i / steps;
-      const f = x < 0.6 ? fStart + ((fMid - fStart) * x) / 0.6 : fMid + ((fEnd - fMid) * (x - 0.6)) / 0.4;
+      const f =
+        x < 0.6
+          ? fStart + ((fMid - fStart) * x) / 0.6
+          : fMid + ((fEnd - fMid) * (x - 0.6)) / 0.4;
       const jitter = (Math.random() * 2 - 1) * (80 + 380 * (1 - debit));
       try {
         bp.frequency.linearRampToValueAtTime(Math.max(300, f + jitter), t);
@@ -502,7 +541,10 @@ export default function Page() {
       g.cancelScheduledValues(now);
       const attack = Math.min(0.05, durSec * 0.22);
       g.setValueAtTime(BASE_NOISE, now);
-      g.linearRampToValueAtTime(targetGain * (0.42 + 0.12 * Math.random()), now + attack);
+      g.linearRampToValueAtTime(
+        targetGain * (0.42 + 0.12 * Math.random()),
+        now + attack
+      );
       const wobbleN = Math.max(2, Math.floor(durSec / 0.1));
       for (let i = 1; i <= wobbleN; i++) {
         const t = now + attack + ((durSec - attack) * i) / wobbleN;
@@ -555,7 +597,9 @@ export default function Page() {
       el.load();
 
       const playP = el.play();
-      const timeout = new Promise((_, rej) => setTimeout(() => rej(new Error("timeout")), 3500));
+      const timeout = new Promise((_, rej) =>
+        setTimeout(() => rej(new Error("timeout")), 3500)
+      );
       await Promise.race([playP, timeout]);
 
       await attachMedia();
@@ -575,7 +619,11 @@ export default function Page() {
       addLog("play_station", { url, compat });
     } catch {
       try {
-        noiseGainRef.current.gain.setTargetAtTime(BASE_NOISE, ctx.currentTime + 0.05, 0.12);
+        noiseGainRef.current.gain.setTargetAtTime(
+          BASE_NOISE,
+          ctx.currentTime + 0.05,
+          0.12
+        );
       } catch {}
       const next = (startIndex + 1) % list.length;
       playingLockRef.current = false;
@@ -608,7 +656,9 @@ export default function Page() {
   function toggleEnr() {
     if (!destRef.current) return;
     if (!enr) {
-      const rec = new MediaRecorder(destRef.current.stream, { mimeType: "audio/webm;codecs=opus" });
+      const rec = new MediaRecorder(destRef.current.stream, {
+        mimeType: "audio/webm;codecs=opus",
+      });
       chunksRef.current = [];
       rec.ondataavailable = (e) => {
         if (e.data.size) chunksRef.current.push(e.data);
@@ -618,7 +668,9 @@ export default function Page() {
         const url = URL.createObjectURL(blob);
         const a = document.createElement("a");
         a.href = url;
-        a.download = `ghostbox-${new Date().toISOString().replace(/[:.]/g, "-")}.webm`;
+        a.download = `ghostbox-${new Date()
+          .toISOString()
+          .replace(/[:.]/g, "-")}.webm`;
         document.body.appendChild(a);
         a.click();
         setTimeout(() => {
@@ -637,10 +689,11 @@ export default function Page() {
     }
   }
 
-  // ------- Réactions contrôles -------
+  /* ------- Réactions contrôles ------- */
   useEffect(() => {
     if (masterRef.current) masterRef.current.gain.value = clamp01(volume);
-    if (audioElRef.current && compat) audioElRef.current.volume = clamp01(volume);
+    if (audioElRef.current && compat)
+      audioElRef.current.volume = clamp01(volume);
   }, [volume, compat]);
 
   useEffect(() => {
@@ -656,12 +709,14 @@ export default function Page() {
     }
     if (marche) startSweep();
     return stopSweep;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [auto, vitesse, marche]);
 
-  // ------- UI -------
+  /* ------- UI ------- */
   const list = stationsRef.current;
   const current = list[idxRef.current];
-  const currentName = current?.name || (current?.url ? safeHost(current.url) : "");
+  const currentName =
+    current?.name || (current?.url ? safeHost(current.url) : "");
 
   return (
     <main style={styles.page}>
@@ -669,7 +724,7 @@ export default function Page() {
         <div style={styles.cabinet}>
           <div style={styles.textureOverlay} />
 
-          {/* En-tête (sans compteur) */}
+          {/* En-tête */}
           <div style={styles.headerBar}>
             <div style={styles.brandPlate}>
               <div style={styles.brandText}>MADAME FANTÔMES</div>
@@ -694,7 +749,11 @@ export default function Page() {
                 <em style={{ opacity: 0.9 }}>{etat}</em>
               </div>
             </div>
-            {compat && <div style={styles.compatBanner}>Compat CORS : traitement radio limité</div>}
+            {compat && (
+              <div style={styles.compatBanner}>
+                Compat CORS : traitement radio limité
+              </div>
+            )}
           </div>
 
           {/* Contrôles */}
@@ -705,22 +764,65 @@ export default function Page() {
                 on={marche}
                 onChange={async (v) => {
                   setMarche(v);
-                  v ? await powerOn() : await powerOff();
+                  if (v) await powerOn();
+                  else await powerOff();
                 }}
               />
-              <Switch label="BALAYAGE AUTO" on={auto} onChange={(v) => { setAuto(v); addLog(v ? "auto_on" : "auto_off"); }} />
-              <Bouton label={enr ? "STOP ENREG." : "ENREGISTRER"} onClick={() => { toggleEnr(); addLog(enr ? "rec_stop" : "rec_start"); }} color={enr ? "#f0c14b" : "#d96254"} />
-              <Bouton label="Exporter log" onClick={exportLog} color="#e2d9c6" />
+              <Switch
+                label="BALAYAGE AUTO"
+                on={auto}
+                onChange={(v) => {
+                  setAuto(v);
+                  addLog(v ? "auto_on" : "auto_off");
+                }}
+              />
+              <Bouton
+                label={enr ? "STOP ENREG." : "ENREGISTRER"}
+                onClick={() => {
+                  toggleEnr();
+                  addLog(enr ? "rec_stop" : "rec_start");
+                }}
+                color={enr ? "#f0c14b" : "#d96254"}
+              />
+              <Bouton
+                label="Exporter log"
+                onClick={exportLog}
+                color="#e2d9c6"
+              />
             </div>
+
             <div style={styles.knobs}>
-              <Knob label="VITESSE" value={vitesse} onChange={(v) => setVitesse(clamp01(v))} hint={`${msFromSpeed(vitesse)} ms`} />
-              <Knob label="VOLUME" value={volume} onChange={(v) => setVolume(clamp01(v))} />
-              <Knob label="ÉCHO" value={echo} onChange={(v) => setEcho(clamp01(v))} />
-              <Knob label="DÉBIT" value={debit} onChange={(v) => setDebit(clamp01(v))} hint={`${burstMs()} ms de bruit`} />
+              <Knob
+                label="VITESSE"
+                value={vitesse}
+                onChange={(v) => setVitesse(clamp01(v))}
+                hint={`${msFromSpeed(vitesse)} ms`}
+              />
+              <Knob
+                label="VOLUME"
+                value={volume}
+                onChange={(v) => setVolume(clamp01(v))}
+              />
+              <Knob
+                label="ÉCHO"
+                value={echo}
+                onChange={(v) => setEcho(clamp01(v))}
+              />
+              <Knob
+                label="DÉBIT"
+                value={debit}
+                onChange={(v) => setDebit(clamp01(v))}
+                hint={`${burstMs()} ms de bruit`}
+              />
             </div>
           </div>
 
-          <audio ref={audioElRef} crossOrigin="anonymous" preload="none" style={{ display: "none" }} />
+          <audio
+            ref={audioElRef}
+            crossOrigin="anonymous"
+            preload="none"
+            style={{ display: "none" }}
+          />
         </div>
 
         <Vis at="tl" />
@@ -730,7 +832,8 @@ export default function Page() {
       </div>
 
       <p style={{ color: "rgba(255,255,255,0.8)", marginTop: 10, fontSize: 12 }}>
-        Si le bruit te gêne encore, baisse <strong>DÉBIT</strong> (0.2–0.4). Le burst reste court et la radio passe devant.
+        Si le bruit te gêne encore, baisse <strong>DÉBIT</strong> (0.2–0.4). Le
+        burst reste court et la radio passe devant.
       </p>
     </main>
   );
@@ -768,8 +871,12 @@ function Switch({ label, on, onChange }) {
   return (
     <div style={ui.switchBlock} onClick={() => onChange(!on)}>
       <div style={ui.switchLabel}>{label}</div>
-      <div style={{ ...ui.switch, background: on ? "#6ad27a" : "#464a58" }}>
-        <div style={{ ...ui.switchDot, transform: `translateX(${on ? 32 : 0}px)` }} />
+      <div
+        style={{ ...ui.switch, background: on ? "#6ad27a" : "#464a58" }}
+      >
+        <div
+          style={{ ...ui.switchDot, transform: `translateX(${on ? 32 : 0}px)` }}
+        />
       </div>
     </div>
   );
@@ -799,12 +906,13 @@ function Lamp({ label, on, colorOn = "#86fb6a" }) {
 }
 
 function Vis({ at }) {
-  const pos = {
-    tl: { top: -8, left: -8 },
-    tr: { top: -8, right: -8 },
-    bl: { bottom: -8, left: -8 },
-    br: { bottom: -8, right: -8 },
-  }[at];
+  const pos =
+    {
+      tl: { top: -8, left: -8 },
+      tr: { top: -8, right: -8 },
+      bl: { bottom: -8, left: -8 },
+      br: { bottom: -8, right: -8 },
+    }[at] || {};
   return <div style={{ ...decor.screw, ...pos }} />;
 }
 
@@ -823,7 +931,8 @@ const styles = {
     borderRadius: 26,
     padding: 16,
     border: "1px solid rgba(48,42,36,0.55)",
-    boxShadow: "0 30px 88px rgba(0,0,0,0.65), inset 0 0 0 1px rgba(255,255,255,0.04)",
+    boxShadow:
+      "0 30px 88px rgba(0,0,0,0.65), inset 0 0 0 1px rgba(255,255,255,0.04)",
     backgroundImage: "url('/skin-watercolor.svg')",
     backgroundSize: "cover",
     backgroundPosition: "center",
@@ -853,20 +962,32 @@ const styles = {
     padding: "10px 14px",
     boxShadow: "inset 0 0 20px rgba(0,0,0,0.45)",
   },
-  brandText: { fontFamily: "Georgia,serif", fontWeight: 800, letterSpacing: 1.5, fontSize: 14 },
+  brandText: {
+    fontFamily: "Georgia,serif",
+    fontWeight: 800,
+    letterSpacing: 1.5,
+    fontSize: 14,
+  },
   brandSub: { fontFamily: "Georgia,serif", fontSize: 12, opacity: 0.8 },
   rightHeader: { display: "flex", alignItems: "center", gap: 12 },
   lampsRow: { display: "flex", gap: 14, alignItems: "center" },
   glass: {
     borderRadius: 16,
     border: "1px solid rgba(35,45,60,0.9)",
-    background: "linear-gradient(180deg, rgba(168,201,210,0.55), rgba(58,88,110,0.6))",
+    background:
+      "linear-gradient(180deg, rgba(168,201,210,0.55), rgba(58,88,110,0.6))",
     padding: 12,
     position: "relative",
     overflow: "hidden",
     boxShadow: "inset 0 0 32px rgba(0,0,0,0.55)",
   },
-  stationRow: { display: "flex", justifyContent: "space-between", color: "#f3efe6", fontSize: 13, padding: "2px 2px" },
+  stationRow: {
+    display: "flex",
+    justifyContent: "space-between",
+    color: "#f3efe6",
+    fontSize: 13,
+    padding: "2px 2px",
+  },
   compatBanner: {
     position: "absolute",
     right: 10,
@@ -878,9 +999,21 @@ const styles = {
     borderRadius: 8,
     fontSize: 12,
   },
-  controlsRow: { marginTop: 16, display: "grid", gridTemplateColumns: "1fr 2fr", gap: 14, alignItems: "center" },
+  controlsRow: {
+    marginTop: 16,
+    display: "grid",
+    gridTemplateColumns: "1fr 2fr",
+    gap: 14,
+    alignItems: "center",
+  },
   switches: { display: "grid", gap: 10, alignContent: "start" },
-  knobs: { display: "grid", gridTemplateColumns: "repeat(4, minmax(120px, 1fr))", gap: 14, alignItems: "center", justifyItems: "center" },
+  knobs: {
+    display: "grid",
+    gridTemplateColumns: "repeat(4, minmax(120px, 1fr))",
+    gap: 14,
+    alignItems: "center",
+    justifyItems: "center",
+  },
 };
 
 const ui = {
@@ -889,22 +1022,65 @@ const ui = {
     width: 100,
     height: 100,
     borderRadius: "50%",
-    background: "radial-gradient(circle at 32% 28%, #6d6f79, #3a3f4a 62%, #1b2230 100%)",
+    background:
+      "radial-gradient(circle at 32% 28%, #6d6f79, #3a3f4a 62%, #1b2230 100%)",
     border: "1px solid rgba(28,30,38,0.9)",
-    boxShadow: "inset 0 12px 30px rgba(0,0,0,0.55), 0 8px 26px rgba(0,0,0,0.45)",
+    boxShadow:
+      "inset 0 12px 30px rgba(0,0,0,0.55), 0 8px 26px rgba(0,0,0,0.45)",
     display: "grid",
     placeItems: "center",
     touchAction: "none",
     userSelect: "none",
     cursor: "grab",
   },
-  knobIndicator: { width: 8, height: 34, borderRadius: 4, background: "#e1b66f", boxShadow: "0 0 10px rgba(225,182,111,0.45)" },
-  knobLabel: { color: "#f0eadc", marginTop: 6, fontSize: 13, letterSpacing: 1.2, textAlign: "center", fontFamily: "Georgia,serif" },
+  knobIndicator: {
+    width: 8,
+    height: 34,
+    borderRadius: 4,
+    background: "#e1b66f",
+    boxShadow: "0 0 10px rgba(225,182,111,0.45)",
+  },
+  knobLabel: {
+    color: "#f0eadc",
+    marginTop: 6,
+    fontSize: 13,
+    letterSpacing: 1.2,
+    textAlign: "center",
+    fontFamily: "Georgia,serif",
+  },
   hint: { color: "rgba(255,255,255,0.7)", fontSize: 11, marginTop: 2 },
-  switchBlock: { display: "grid", gridTemplateColumns: "auto 1fr", alignItems: "center", gap: 10, cursor: "pointer" },
-  switchLabel: { color: "#f0eadc", fontSize: 12, letterSpacing: 1.2, fontFamily: "Georgia,serif" },
-  switch: { width: 64, height: 26, borderRadius: 16, position: "relative", border: "1px solid rgba(40,44,56,0.9)", background: "linear-gradient(180deg,#2a2f36,#20252d)" },
-  switchDot: { width: 24, height: 24, borderRadius: "50%", background: "#10151c", border: "1px solid #2b2f39", position: "absolute", top: 1, left: 1, transition: "transform .15s" },
+  switchBlock: {
+    display: "grid",
+    gridTemplateColumns: "auto 1fr",
+    alignItems: "center",
+    gap: 10,
+    cursor: "pointer",
+  },
+  switchLabel: {
+    color: "#f0eadc",
+    fontSize: 12,
+    letterSpacing: 1.2,
+    fontFamily: "Georgia,serif",
+  },
+  switch: {
+    width: 64,
+    height: 26,
+    borderRadius: 16,
+    position: "relative",
+    border: "1px solid rgba(40,44,56,0.9)",
+    background: "linear-gradient(180deg,#2a2f36,#20252d)",
+  },
+  switchDot: {
+    width: 24,
+    height: 24,
+    borderRadius: "50%",
+    background: "#10151c",
+    border: "1px solid #2b2f39",
+    position: "absolute",
+    top: 1,
+    left: 1,
+    transition: "transform .15s",
+  },
   button: {
     cursor: "pointer",
     border: "1px solid rgba(60,48,38,0.8)",
@@ -927,8 +1103,10 @@ const decor = {
     width: 18,
     height: 18,
     borderRadius: "50%",
-    background: "radial-gradient(circle at 30% 30%, #9aa0ad, #4b515e 60%, #1e232d)",
+    background:
+      "radial-gradient(circle at 30% 30%, #9aa0ad, #4b515e 60%, #1e232d)",
     border: "1px solid #222834",
-    boxShadow: "0 8px 20px rgba(0,0,0,0.5), inset 0 3px 8px rgba(0,0,0,0.6)",
+    boxShadow:
+      "0 8px 20px rgba(0,0,0,0.5), inset 0 3px 8px rgba(0,0,0,0.6)",
   },
 };
