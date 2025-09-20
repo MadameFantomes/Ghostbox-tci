@@ -27,12 +27,6 @@
     { "name": "France Bleu Paris",     "url": "https://direct.francebleu.fr/live/fb1071-midfi.mp3" }
   ],
 
-  "Suisse": [
-    { "name": "Radio Swiss Pop",     "url": "https://stream.srg-ssr.ch/srgssr/rsp/aac/96" },
-    { "name": "Radio Swiss Classic", "url": "https://stream.srg-ssr.ch/srgssr/rsc/aac/96" },
-    { "name": "Radio Swiss Jazz",    "url": "https://stream.srg-ssr.ch/srgssr/rsj/aac/96" }
-  ],
-
   "Belgique (RTBF)": [
     { "name": "Classic 21",   "url": "https://icecast.rtbf.be/classic21-128.mp3" },
     { "name": "La Première",  "url": "https://icecast.rtbf.be/lapremiere-128.mp3" },
@@ -43,10 +37,6 @@
 
   "International (News/Talk)": [
     { "name": "BBC World Service (EN)", "url": "https://stream.live.vc.bbcmedia.co.uk/bbc_world_service" },
-    { "name": "NPR News (EN)",          "url": "https://npr-ice.streamguys1.com/live.mp3" },
-    { "name": "WNYC FM (NYC)",          "url": "https://stream.wnyc.org/wnycfm" },
-    { "name": "WNYC AM (News/Talk)",    "url": "https://stream.wnyc.org/wnycam" }
-  ],
 
   "Indés / Monde": [
     { "name": "Radio Paradise Main (AAC 320)",   "url": "https://stream.radioparadise.com/aac-320" },
@@ -54,28 +44,5 @@
     { "name": "Radio Paradise Rock (AAC 320)",   "url": "https://stream.radioparadise.com/rock-320" },
     { "name": "Radio Paradise World (AAC 320)",  "url": "https://stream.radioparadise.com/world-320" },
 
-    { "name": "SomaFM Groove Salad",      "url": "https://ice5.somafm.com/groovesalad-128-mp3" },
-    { "name": "SomaFM Lush",              "url": "https://ice5.somafm.com/lush-128-mp3" },
-    { "name": "SomaFM Drone Zone",        "url": "https://ice5.somafm.com/dronezone-128-mp3" },
-    { "name": "SomaFM Space Station",     "url": "https://ice5.somafm.com/spacestation-128-mp3" },
-    { "name": "SomaFM Secret Agent",      "url": "https://ice5.somafm.com/secretagent-128-mp3" },
-    { "name": "SomaFM Beat Blender",      "url": "https://ice5.somafm.com/beatblender-128-mp3" },
-    { "name": "SomaFM Digitalis",         "url": "https://ice5.somafm.com/digitalis-128-mp3" },
-    { "name": "SomaFM Cliqhop IDM",       "url": "https://ice5.somafm.com/cliqhop-128-mp3" },
-    { "name": "SomaFM PopTron",           "url": "https://ice5.somafm.com/poptron-128-mp3" },
-    { "name": "SomaFM Indie Pop Rocks!",  "url": "https://ice5.somafm.com/indiepop-128-mp3" },
-    { "name": "SomaFM Suburbs of Goa",    "url": "https://ice5.somafm.com/suburbsofgoa-128-mp3" },
-    { "name": "SomaFM Doomed",            "url": "https://ice5.somafm.com/doomed-128-mp3" },
-    { "name": "SomaFM SF 10-33",          "url": "https://ice5.somafm.com/sf1033-128-mp3" },
-    { "name": "SomaFM DEF CON Radio",     "url": "https://ice5.somafm.com/defcon-128-mp3" },
-    { "name": "SomaFM Deep Space One",    "url": "https://ice5.somafm.com/deepspaceone-128-mp3" },
-    { "name": "SomaFM BAGeL Radio",       "url": "https://ice5.somafm.com/bagel-128-mp3" },
-    { "name": "SomaFM Left Coast 70s",    "url": "https://ice5.somafm.com/leftcoast70s-128-mp3" },
-    { "name": "SomaFM Underground 80s",   "url": "https://ice5.somafm.com/u80s-128-mp3" },
-    { "name": "SomaFM The Trip",          "url": "https://ice5.somafm.com/thetrip-128-mp3" },
-    { "name": "SomaFM Sonic Universe",    "url": "https://ice5.somafm.com/sonicuniverse-128-mp3" },
-    { "name": "SomaFM Mission Control",   "url": "https://ice5.somafm.com/missioncontrol-128-mp3" },
-    { "name": "SomaFM ThistleRadio",      "url": "https://ice5.somafm.com/thistle-128-mp3" },
-    { "name": "SomaFM Boot Liquor",       "url": "https://ice5.somafm.com/bootliquor-128-mp3" }
   ]
 }
