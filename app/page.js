@@ -1,7 +1,8 @@
 "use client";
 
 /**
- * Ghostbox TCI — FR (vintage + sliders + MP3 via CDN + MODE KÖNIG adouci)
+ * Ghostbox TCI — FR (radio en avant + sliders + MP3 via CDN + MODE KÖNIG ultra-doux)
+ * - Radio branchée en direct (bypass filtres) pour une audibilité forte et claire
  * - Enreg. MP3 (MediaRecorder si possible, sinon lamejs via CDN)
  * - Balayage corrigé : hard reset + cache-bust + wait canplay + écho muet pendant le scan
  * - Anti-répétition : prérôlage ~1 s avant la montée + cooldown station 15 s
@@ -12,7 +13,7 @@
 
 import React, { useEffect, useRef, useState } from "react";
 
-const AUTO_FILTER = true;
+const AUTO_FILTER = false; // >>> radio brute (bypass filtres pour garder la radio bien devant)
 
 // ------- Fallback (FR directs) -------
 const FALLBACK_STATIONS = [
@@ -56,7 +57,7 @@ export default function Page() {
   const noiseLPRef = useRef(null);
   const noiseGainRef = useRef(null);
 
-  // Radio FX
+  // Radio FX (conservés mais bypass si AUTO_FILTER=false)
   const radioHPRef = useRef(null);
   const radioLPRef = useRef(null);
   const radioShelfRef = useRef(null);
@@ -124,7 +125,7 @@ export default function Page() {
   // Helpers
   const clamp01 = (x) => Math.max(0, Math.min(1, x));
   const msFromSpeed = (v) => Math.round(250 + v * (2500 - 250));
-  const BASE_NOISE = 0.006; // bruit très bas
+  const BASE_NOISE = 0.002; // <<< bruit de fond encore plus bas
   const burstMs = () => Math.round(120 + debit * 520);
   const burstGain = () => Math.min(0.4, 0.08 + debit * 0.32);
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -244,7 +245,7 @@ export default function Page() {
     noiseHPRef.current = hpN; noiseFilterRef.current = bp; noiseLPRef.current = lpN;
     const gNoise = ctx.createGain(); gNoise.gain.value = 0; noiseGainRef.current = gNoise;
 
-    // Radio auto-filtre
+    // Radio auto-filtre (restent dispo si jamais tu remets AUTO_FILTER=true)
     const hp = ctx.createBiquadFilter(); hp.type = "highpass"; hp.frequency.value = 320; hp.Q.value = 0.7;
     const lp = ctx.createBiquadFilter(); lp.type = "lowpass"; lp.frequency.value = 3400; lp.Q.value = 0.7;
     const shelf = ctx.createBiquadFilter(); shelf.type = "highshelf"; shelf.frequency.value = 2500; shelf.gain.value = -4;
@@ -312,15 +313,10 @@ export default function Page() {
       const src = ctxRef.current.createMediaElementSource(audioElRef.current);
       mediaSrcRef.current = src;
 
-      if (AUTO_FILTER && radioHPRef.current) {
-        src.connect(radioHPRef.current); radioHPRef.current.connect(radioLPRef.current);
-        radioLPRef.current.connect(radioShelfRef.current); radioShelfRef.current.connect(driveRef.current);
-        driveRef.current.connect(radioGainRef.current);
-      } else {
-        src.connect(radioGainRef.current);
-      }
+      // >>> RADIO BRUTE (bypass des filtres pour maximiser l'audibilité)
+      src.connect(radioGainRef.current);
 
-      // ducking du bruit
+      // ducking du bruit quand la radio joue (utile même en brut)
       const el = audioElRef.current;
       const duckToFloor = () => {
         const now = ctxRef.current.currentTime;
@@ -349,7 +345,7 @@ export default function Page() {
     }
   }
 
-  // ------- MODE KÖNIG impl (adouci) -------
+  // ------- MODE KÖNIG impl (ultra-doux) -------
   function kngEnable() {
     if (kngEnabledRef.current) return;
     const ctx = ctxRef.current; if (!ctx || !sumRef.current || !masterRef.current) return;
@@ -386,26 +382,26 @@ export default function Page() {
     kngProcRef.current = proc; kngWetRef.current = wet;
 
     // montée très douce du mix traité (faible)
-    try { wet.gain.setTargetAtTime(0.12, ctx.currentTime, 0.15); } catch {}
+    try { wet.gain.setTargetAtTime(0.06, ctx.currentTime, 0.15); } catch {}
 
     // 2) Multi-porteuses + battements (très doux)
-    const bus = ctx.createGain(); bus.gain.value = 0.04; // global carriers
+    const bus = ctx.createGain(); bus.gain.value = 0.02; // global carriers
     bus.connect(sumRef.current); kngOscBusRef.current = bus;
 
     const freqs = [1700, 2300, 3100, 5000, 8500];
     const oscList = [];
     freqs.forEach((f) => {
       const osc = ctx.createOscillator(); osc.type = "sine"; osc.frequency.value = f;
-      const g = ctx.createGain(); g.gain.value = 0.002; // base minuscule
+      const g = ctx.createGain(); g.gain.value = 0.0015; // base minuscule
       osc.connect(g); g.connect(bus);
 
       // LFO lent 0.2..1.8 Hz — modulation d'amplitude
       const lfo = ctx.createOscillator(); lfo.type = "sine"; lfo.frequency.value = 0.2 + Math.random() * 1.6;
-      const lfoAmp = ctx.createGain(); lfoAmp.gain.value = 0.0015; // profondeur
+      const lfoAmp = ctx.createGain(); lfoAmp.gain.value = 0.001; // profondeur
       lfo.connect(lfoAmp); lfoAmp.connect(g.gain);
 
       // Offset DC pour part constante
-      const base = ctx.createConstantSource(); base.offset.value = 0.0015; base.connect(g.gain); base.start();
+      const base = ctx.createConstantSource(); base.offset.value = 0.001; base.connect(g.gain); base.start();
 
       try { osc.start(); lfo.start(); } catch {}
       oscList.push({ osc, g, lfo, lfoAmp, base });
@@ -522,7 +518,7 @@ export default function Page() {
     const ctx = ctxRef.current; const now = ctx.currentTime;
     const dur = burstMs() / 1000; const targetNoise = burstGain();
 
-    // 1) clic + montée du bruit + baisse radio + MUTE ECHO
+    // 1) clic + montée du bruit + radio abaissée (20%) + MUTE ECHO
     triggerClick();
     try {
       echoWetRef.current.gain.cancelScheduledValues(now);
@@ -531,8 +527,12 @@ export default function Page() {
     try {
       if (!compat) {
         radioGainRef.current.gain.cancelScheduledValues(now);
-        radioGainRef.current.gain.linearRampToValueAtTime(0.0001, now + 0.05);
-      } else { el.volume = 0; }
+        // on laisse un filet de radio pendant le burst (20%)
+        radioGainRef.current.gain.linearRampToValueAtTime(0.2, now + 0.05);
+      } else {
+        el.muted = false;
+        el.volume = Math.min(0.25, clamp01(volume));
+      }
     } catch {}
 
     playScanBurst(targetNoise, dur);
@@ -545,6 +545,8 @@ export default function Page() {
       await hardStop(el);
       el.crossOrigin = "anonymous";
       el.preload = "none";
+      el.muted = false;
+      el.volume = clamp01(volume);
       el.src = cacheBust(url);
       try {
         el.playbackRate = lent ? 0.88 : 1;
@@ -563,8 +565,12 @@ export default function Page() {
       const after = ctx.currentTime + Math.max(0.10, dur * 0.55) + (prerollMs / 1000);
       try {
         noiseGainRef.current.gain.setTargetAtTime(BASE_NOISE, after, 0.1);
-        if (!compat) radioGainRef.current.gain.setTargetAtTime(1, after, 0.07);
-        else el.volume = clamp01(volume);
+        if (!compat) {
+          radioGainRef.current.gain.setTargetAtTime(1, after, 0.07); // radio plein pot
+        } else {
+          el.muted = false;
+          el.volume = clamp01(volume); // rétablit le volume <audio>
+        }
         // rétablir l'écho selon le slider
         echoWetRef.current.gain.setTargetAtTime(echo * 0.9, after + 0.05, 0.12);
       } catch {}
@@ -710,7 +716,7 @@ export default function Page() {
   /* ------- Réactions contrôles ------- */
   useEffect(() => {
     if (masterRef.current) masterRef.current.gain.value = clamp01(volume);
-    if (audioElRef.current && compat) audioElRef.current.volume = clamp01(volume);
+    if (audioElRef.current && compat) { audioElRef.current.volume = clamp01(volume); audioElRef.current.muted = false; }
   }, [volume, compat]);
   useEffect(() => {
     if (!echoWetRef.current || !echoFbRef.current) return;
@@ -806,7 +812,7 @@ export default function Page() {
       </div>
 
       <p style={{ color: "rgba(60,40,20,0.85)", marginTop: 10, fontSize: 12 }}>
-        KÖNIG doux (radio devant) • Prérôlage anti-répétition • Cooldown stations 15s • MP3 via CDN.
+        Radio brute (bypass filtres) • Prérôlage anti-répétition • Cooldown 15s • KÖNIG doux • MP3 via CDN.
       </p>
     </main>
   );
