@@ -1,26 +1,39 @@
 "use client";
 
 /**
- * Ghostbox TCI — FR (radio + phonèmes)
- * - Mode RADIO (flux HTTPS) / Mode PHONÈMES (échantillons .wav)
- * - Bruit de fond discret, burst de balayage plafonné, ducking auto
- * - Enregistrement .webm, balayage auto + skip flux HS (timeout)
+ * Ghostbox TCI — FR (simple & stable)
+ * - Mode RADIO uniquement
+ * - Bruit discret, burst de balayage plafonné, ducking auto
+ * - Enregistrement MP3 si supporté (fallback WebM)
  * - Auto-filtre “TCI” si WebAudio autorisé (compat sinon)
- * - Charge /public/stations.json sinon fallback
+ * - Charge /public/stations.json sinon fallback FR
  * - LOG minimal : localStorage("ghostbox.logs") + BroadcastChannel("labo-ghostbox")
+ * - NO PHONÈMES UI • NO "DÉBIT" KNOB • + Switch "RALENTI"
  */
 
 import React, { useEffect, useRef, useState } from "react";
 
 const AUTO_FILTER = true;
 
-// ------- Fallback -------
+// ------- Fallback (FR directs) -------
 const FALLBACK_STATIONS = [
   "https://icecast.radiofrance.fr/franceinfo-midfi.mp3",
   "https://icecast.radiofrance.fr/franceinter-midfi.mp3",
   "https://icecast.radiofrance.fr/franceculture-midfi.mp3",
+  "https://icecast.radiofrance.fr/francemusique-midfi.mp3",
   "https://icecast.radiofrance.fr/fip-midfi.mp3",
-  "https://stream.srg-ssr.ch/srgssr/rsj/aac/96",
+  "https://icecast.radiofrance.fr/fipjazz-midfi.mp3",
+  "https://icecast.radiofrance.fr/fiprock-midfi.mp3",
+  "https://icecast.radiofrance.fr/fipgroove-midfi.mp3",
+  "https://icecast.radiofrance.fr/mouv-midfi.mp3",
+  "https://stream.europe1.fr/europe1.mp3",
+  "https://rmc.bfmtv.com/rmcinfo-mp3",
+  "https://streaming.radio.rtl.fr/rtl-1-44-128",
+  "https://streaming.radio.rtl2.fr/rtl2-1-44-128",
+  "https://streaming.radio.funradio.fr/fun-1-44-128",
+  "https://start-sud.ice.infomaniak.ch/start-sud-high.mp3",
+  "https://radioclassique.ice.infomaniak.ch/radioclassique-high.mp3",
+  "https://live02.rfi.fr/rfimonde-64.mp3",
 ].map((url) => ({ name: safeHost(url), url }));
 
 function safeHost(url) {
@@ -74,6 +87,7 @@ export default function Page() {
   const [marche, setMarche] = useState(false);
   const [auto, setAuto] = useState(false);
   const [compat, setCompat] = useState(false);
+  const [lent, setLent] = useState(false); // <- NOUVEAU
   const sweepTimerRef = useRef(null);
   const playingLockRef = useRef(false);
 
@@ -81,26 +95,14 @@ export default function Page() {
   const [vitesse, setVitesse] = useState(0.45); // 250..2500 ms
   const [volume, setVolume] = useState(0.9);
   const [echo, setEcho] = useState(0.3); // mix + fb
-  const [debit, setDebit] = useState(0.4); // plus doux par défaut
+  const [debit] = useState(0.35); // fixé, plus de knob UI
 
   // Enregistrement
   const [enr, setEnr] = useState(false);
   const recRef = useRef(null);
   const chunksRef = useRef([]);
 
-  // ------- Mode & LOG -------
-  const [mode, setMode] = useState("radio"); // "radio" | "phoneme"
-  const phonemeSrcRef = useRef(null); // source en cours pour le mode phonème
-  const PHONEMES = useRef([
-    "/phonemes/a.wav",
-    "/phonemes/e.wav",
-    "/phonemes/i.wav",
-    "/phonemes/o.wav",
-    "/phonemes/u.wav",
-    "/phonemes/s.wav",
-    "/phonemes/m.wav",
-  ]); // => place ces fichiers dans public/phonemes
-
+  // ------- LOG minimal -------
   const logRef = useRef([]);
   const bcRef = useRef(null); // BroadcastChannel
 
@@ -111,6 +113,7 @@ export default function Page() {
   const burstMs = () => Math.round(120 + debit * 520); // 120..640 ms
   const burstGain = () => Math.min(0.4, 0.08 + debit * 0.32); // plafonné à ~0.40
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const sweepDelayMs = () => Math.round(msFromSpeed(vitesse) * (lent ? 2.5 : 1)); // <- ralenti
 
   // ------- LOG setup -------
   useEffect(() => {
@@ -128,12 +131,12 @@ export default function Page() {
     const entry = {
       timestamp: new Date().toISOString(),
       event,
-      mode,
       vitesse,
+      lent,
       volume,
       debit,
       echo,
-      station: mode === "radio" ? (stationsRef.current[idxRef.current]?.name || null) : null,
+      station: stationsRef.current[idxRef.current]?.name || null,
       ...extra,
     };
     logRef.current.push(entry);
@@ -268,7 +271,7 @@ export default function Page() {
     const lpN = ctx.createBiquadFilter();
     lpN.type = "lowpass";
     lpN.frequency.value = 5200;
-    lpN.Q.value = 0.3; // un peu plus sombre
+    lpN.Q.value = 0.3;
 
     noiseHPRef.current = hpN;
     noiseFilterRef.current = bp;
@@ -449,11 +452,7 @@ export default function Page() {
       noiseGainRef.current.gain.value = BASE_NOISE;
     } catch {}
     addLog("power_on");
-    if (mode === "radio") {
-      await playIndex(idxRef.current);
-    } else {
-      await startPhonemeMode();
-    }
+    await playIndex(idxRef.current);
     setMarche(true);
   }
 
@@ -469,12 +468,6 @@ export default function Page() {
       el.load();
     }
     if (attachMedia._cleanup) attachMedia._cleanup();
-
-    // stop phonème si actif
-    try {
-      phonemeSrcRef.current?.stop?.();
-    } catch {}
-    phonemeSrcRef.current = null;
 
     if (enr) {
       try {
@@ -528,7 +521,7 @@ export default function Page() {
       lp = noiseLPRef.current;
     const g = noiseGainRef.current?.gain;
 
-    // couleur selon DÉBIT
+    // couleur selon DÉBIT (fixé)
     const q = 0.35 + debit * 0.45; // 0.35..0.80
     const lpF = 4200 + debit * 1600; // 4.2..5.8 kHz
     const hpF = 160 + debit * 180; // 160..340 Hz
@@ -574,7 +567,7 @@ export default function Page() {
     } catch {}
   }
 
-  // ------- Lecture robuste (RADIO) -------
+  // ------- Lecture robuste -------
   async function playIndex(startIndex, tries = 0) {
     const list = stationsRef.current;
     if (!list.length) return;
@@ -616,6 +609,15 @@ export default function Page() {
       el.src = url;
       el.load();
 
+      // appliquer le ralenti au besoin
+      try {
+        el.playbackRate = lent ? 0.88 : 1;
+        // certains navigateurs utilisent preservesPitch ou mozPreservesPitch
+        if ("preservesPitch" in el) el.preservesPitch = false;
+        if ("mozPreservesPitch" in el) el.mozPreservesPitch = false;
+        if ("webkitPreservesPitch" in el) el.webkitPreservesPitch = false;
+      } catch {}
+
       const playP = el.play();
       const timeout = new Promise((_, rej) =>
         setTimeout(() => rej(new Error("timeout")), 3500)
@@ -654,108 +656,60 @@ export default function Page() {
     playingLockRef.current = false;
   }
 
-  // ------- Mode PHONÈMES -------
-  async function startPhonemeMode() {
-    const ctx = ctxRef.current;
-    if (!ctx) return;
-
-    // petite montée du bruit comme pour une station
-    const dur = 0.2;
-    playScanBurst(Math.min(0.25, burstGain()), dur);
-    setEtat("phonèmes…");
-
-    await scheduleNextPhoneme();
-  }
-
-  async function scheduleNextPhoneme() {
-    const ctx = ctxRef.current;
-    if (!ctx || mode !== "phoneme" || !marche) return;
-
-    try {
-      // choisir un échantillon
-      const list = PHONEMES.current;
-      const url = list[Math.floor(Math.random() * list.length)];
-      const resp = await fetch(url, { cache: "no-store" });
-      const arr = await resp.arrayBuffer();
-      const buf = await ctx.decodeAudioData(arr);
-
-      // créer la source
-      const src = ctx.createBufferSource();
-      src.buffer = buf;
-      src.playbackRate.value = 0.9 + Math.random() * 0.3; // légère variation
-
-      // chemin d'effets identique à la radio (si permis)
-      if (AUTO_FILTER && radioHPRef.current) {
-        src.connect(radioHPRef.current);
-      } else {
-        src.connect(radioGainRef.current);
-      }
-
-      // au démarrage, on abaisse le bruit
-      const after = ctx.currentTime + 0.05;
-      try {
-        noiseGainRef.current.gain.setTargetAtTime(BASE_NOISE, after, 0.1);
-      } catch {}
-
-      // chainage
-      src.onended = () => {
-        if (phonemeSrcRef.current === src) phonemeSrcRef.current = null;
-        scheduleNextPhoneme();
-      };
-
-      // garder la ref pour pouvoir stop
-      try {
-        phonemeSrcRef.current?.stop?.();
-      } catch {}
-      phonemeSrcRef.current = src;
-
-      addLog("play_phoneme", { file: url });
-      setEtat("lecture phonèmes");
-      src.start();
-    } catch {
-      // en cas d'erreur réseau/décodage, on retente
-      setTimeout(scheduleNextPhoneme, 300);
-    }
-  }
-
-  // ------- Balayage auto (RADIO uniquement) -------
+  // ------- Balayage auto -------
   function startSweep() {
     stopSweep();
     const tick = async () => {
       if (!marche) return;
-      if (mode !== "radio") return;
       const list = stationsRef.current;
       if (!list.length) return;
       const next = (idxRef.current + 1) % list.length;
       await playIndex(next);
-      sweepTimerRef.current = setTimeout(tick, msFromSpeed(vitesse));
+      sweepTimerRef.current = setTimeout(tick, sweepDelayMs());
     };
-    sweepTimerRef.current = setTimeout(tick, msFromSpeed(vitesse));
+    sweepTimerRef.current = setTimeout(tick, sweepDelayMs());
   }
   function stopSweep() {
     if (sweepTimerRef.current) clearTimeout(sweepTimerRef.current);
     sweepTimerRef.current = null;
   }
 
-  // ------- Enregistrement -------
+  // ------- Enregistrement (MP3 si possible, sinon WebM) -------
   function toggleEnr() {
     if (!destRef.current) return;
+
     if (!enr) {
-      const rec = new MediaRecorder(destRef.current.stream, {
-        mimeType: "audio/webm;codecs=opus",
-      });
+      // on privilégie MP3, sinon on retombe sur WebM/Opus
+      let options = { mimeType: "audio/mpeg" };
+      if (
+        !("MediaRecorder" in window) ||
+        !MediaRecorder.isTypeSupported?.(options.mimeType)
+      ) {
+        options = { mimeType: "audio/webm;codecs=opus" };
+      }
+
+      let rec;
+      try {
+        rec = new MediaRecorder(destRef.current.stream, options);
+      } catch (e) {
+        // dernier recours : sans mimeType
+        rec = new MediaRecorder(destRef.current.stream);
+      }
+
       chunksRef.current = [];
       rec.ondataavailable = (e) => {
-        if (e.data.size) chunksRef.current.push(e.data);
+        if (e.data && e.data.size) chunksRef.current.push(e.data);
       };
       rec.onstop = () => {
-        const blob = new Blob(chunksRef.current, { type: "audio/webm" });
+        const mime = rec.mimeType || "audio/webm";
+        const ext = /mpeg/i.test(mime) ? "mp3" : "webm";
+        const blob = new Blob(chunksRef.current, { type: mime });
         const url = URL.createObjectURL(blob);
         const a = document.createElement("a");
         a.href = url;
         a.download = `ghostbox-${new Date()
           .toISOString()
-          .replace(/[:.]/g, "-")}.webm`;
+          .replace(/[:.]/g, "-")}.${ext}`;
         document.body.appendChild(a);
         a.click();
         setTimeout(() => {
@@ -763,6 +717,7 @@ export default function Page() {
           URL.revokeObjectURL(url);
         }, 0);
       };
+
       rec.start();
       recRef.current = rec;
       setEnr(true);
@@ -792,42 +747,28 @@ export default function Page() {
       stopSweep();
       return;
     }
-    if (marche && mode === "radio") startSweep();
+    if (marche) startSweep();
     return stopSweep;
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [auto, vitesse, marche, mode]);
+  }, [auto, vitesse, marche, lent]); // <- lent affecte l'intervalle
 
-  // Bascule de mode en cours de marche
+  // appliquer le ralenti sur la lecture actuelle aussi
   useEffect(() => {
-    if (!marche) return;
-    (async () => {
-      if (mode === "radio") {
-        // stop phonème → relancer radio
-        try {
-          phonemeSrcRef.current?.stop?.();
-        } catch {}
-        phonemeSrcRef.current = null;
-        await playIndex(idxRef.current);
-      } else {
-        // stop radio → lancer phonèmes
-        const el = audioElRef.current;
-        if (el) {
-          el.pause();
-          el.src = "";
-          el.load();
-        }
-        await startPhonemeMode();
-      }
-    })();
-  }, [mode, marche]); // eslint-disable-line react-hooks/exhaustive-deps
+    const el = audioElRef.current;
+    if (!el) return;
+    try {
+      el.playbackRate = lent ? 0.88 : 1;
+      if ("preservesPitch" in el) el.preservesPitch = false;
+      if ("mozPreservesPitch" in el) el.mozPreservesPitch = false;
+      if ("webkitPreservesPitch" in el) el.webkitPreservesPitch = false;
+    } catch {}
+  }, [lent]);
 
   /* ------- UI ------- */
   const list = stationsRef.current;
   const current = list[idxRef.current];
   const currentName =
-    mode === "radio"
-      ? current?.name || (current?.url ? safeHost(current.url) : "")
-      : "Mode PHONÈMES";
+    current?.name || (current?.url ? safeHost(current.url) : "");
 
   return (
     <main style={styles.page}>
@@ -860,7 +801,7 @@ export default function Page() {
                 <em style={{ opacity: 0.9 }}>{etat}</em>
               </div>
             </div>
-            {compat && mode === "radio" && (
+            {compat && (
               <div style={styles.compatBanner}>
                 Compat CORS : traitement radio limité
               </div>
@@ -887,32 +828,14 @@ export default function Page() {
                   addLog(v ? "auto_on" : "auto_off");
                 }}
               />
-
-              {/* Sélecteur de mode */}
-              <div style={{ display: "grid", gap: 6 }}>
-                <div style={ui.switchLabel}>MODE</div>
-                <div style={{ display: "flex", gap: 8 }}>
-                  <Bouton
-                    label="RADIO"
-                    onClick={async () => {
-                      if (mode === "radio") return;
-                      setMode("radio");
-                      addLog("mode_radio");
-                    }}
-                    color={mode === "radio" ? "#86fb6a" : "#3e4a56"}
-                  />
-                  <Bouton
-                    label="PHONÈMES"
-                    onClick={async () => {
-                      if (mode === "phoneme") return;
-                      setMode("phoneme");
-                      addLog("mode_phoneme");
-                    }}
-                    color={mode === "phoneme" ? "#86c7fb" : "#3e4a56"}
-                  />
-                </div>
-              </div>
-
+              <Switch
+                label="RALENTI"
+                on={lent}
+                onChange={(v) => {
+                  setLent(v);
+                  addLog(v ? "slow_on" : "slow_off");
+                }}
+              />
               <Bouton
                 label={enr ? "STOP ENREG." : "ENREGISTRER"}
                 onClick={() => {
@@ -933,7 +856,7 @@ export default function Page() {
                 label="VITESSE"
                 value={vitesse}
                 onChange={(v) => setVitesse(clamp01(v))}
-                hint={`${msFromSpeed(vitesse)} ms`}
+                hint={`${sweepDelayMs()} ms`} // affiche l'intervalle effectif
               />
               <Knob
                 label="VOLUME"
@@ -945,12 +868,7 @@ export default function Page() {
                 value={echo}
                 onChange={(v) => setEcho(clamp01(v))}
               />
-              <Knob
-                label="DÉBIT"
-                value={debit}
-                onChange={(v) => setDebit(clamp01(v))}
-                hint={`${burstMs()} ms de bruit`}
-              />
+              {/* Knob DÉBIT retiré */}
             </div>
           </div>
 
@@ -969,8 +887,8 @@ export default function Page() {
       </div>
 
       <p style={{ color: "rgba(255,255,255,0.8)", marginTop: 10, fontSize: 12 }}>
-        Si le bruit te gêne encore, baisse <strong>DÉBIT</strong> (0.2–0.4). Le
-        burst reste court et la radio passe devant.
+        Active <strong>RALENTI</strong> pour laisser plus de temps entre les passages et
+        adoucir la lecture. Enregistrement en MP3 si supporté par le navigateur.
       </p>
     </main>
   );
@@ -989,9 +907,9 @@ function Knob({ label, value, onChange, hint }) {
           setDrag({ y: e.clientY, v: value });
         }}
         onPointerMove={(e) => {
-            if (!drag) return;
-            const d = (drag.y - e.clientY) / 220;
-            onChange(drag.v + d);
+          if (!drag) return;
+          const d = (drag.y - e.clientY) / 220;
+          onChange(drag.v + d);
         }}
         onPointerUp={() => setDrag(null)}
         onPointerCancel={() => setDrag(null)}
@@ -1146,7 +1064,7 @@ const styles = {
   switches: { display: "grid", gap: 10, alignContent: "start" },
   knobs: {
     display: "grid",
-    gridTemplateColumns: "repeat(4, minmax(120px, 1fr))",
+    gridTemplateColumns: "repeat(3, minmax(120px, 1fr))", // 3 knobs (plus de DÉBIT)
     gap: 14,
     alignItems: "center",
     justifyItems: "center",
