@@ -1,11 +1,11 @@
 "use client";
 
 /**
- * Ghostbox TCI — FR (balayage pur, sans “tube”, sans garde-voix)
- * - HP/LP simples (pas de convolver ni saturation)
- * - Balayage continu (VITESSE)
- * - Bruit blanc modulé “lit de bruit” en fond + impulsions de scan
- * - LIVE+ (Radios parlées MP3/HTTPS) + Anti-boucle + Enregistrement MP3/WAV
+ * Ghostbox TCI — FR (balayage modulé “parfait”)
+ * - EQ simple (HP/LP), pas de convolver ni saturation
+ * - Balayage continu (VITESSE) + lit de bruit modulé organique + impulsions au scan
+ * - LIVE+ (RadioBrowser MP3/HTTPS) + Anti-boucle + Enregistrement MP3/WAV
+ * - UI FR : MARCHE, BALAYAGE AUTO, LIVE+, ENREGISTRER • Knobs : VITESSE, VOLUME, ÉCHO, BRUIT
  */
 
 import React, { useEffect, useRef, useState } from "react";
@@ -108,7 +108,7 @@ export default function Page() {
   const [vitesse, setVitesse] = useState(0.45); // 250..2500 ms
   const [volume, setVolume]   = useState(0.9);
   const [echo, setEcho]       = useState(0.18);
-  const [bruit, setBruit]     = useState(0.28); // plus doux par défaut
+  const [bruit, setBruit]     = useState(0.28); // doux par défaut
 
   // Enregistrement
   const [enr, setEnr] = useState(false);
@@ -120,11 +120,11 @@ export default function Page() {
   const [livePlus, setLivePlus] = useState(false);
   const augmentingRef = useRef(false);
 
-  // Bruit helpers
-  const BASE_NOISE = 0.0045; // lit de bruit bas
+  /* ===== Bruit (profil “parfait”) ===== */
+  const BASE_NOISE = 0.0032; // lit très discret
   const msFromSpeed = (v) => Math.round(250 + v * (2500 - 250));
-  const burstMs  = () => Math.round(120 + bruit * 520);
-  const burstGain = () => Math.min(0.32, 0.06 + bruit * 0.26); // burst plus discret qu'avant
+  const burstMs  = () => Math.round(110 + bruit * 460); // durée d’impulsion
+  const burstGain = () => Math.min(0.26, 0.05 + bruit * 0.22); // niveau d’impulsion (reste doux)
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   const supportsType = (m) => window.MediaRecorder?.isTypeSupported?.(m) || false;
 
@@ -233,7 +233,7 @@ export default function Page() {
     const dest = ctx.createMediaStreamDestination(); destRef.current = dest;
     master.connect(dest);
 
-    // Radio path (EQ simple sans “tube”)
+    // Radio path (EQ simple)
     const hp = ctx.createBiquadFilter();  hp.type = "highpass"; hp.frequency.value = 240; hp.Q.value = 0.7;
     const lp = ctx.createBiquadFilter();  lp.type = "lowpass";  lp.frequency.value = 5800; lp.Q.value = 0.7;
     const gRadio = ctx.createGain(); gRadio.gain.value = 1;
@@ -241,7 +241,7 @@ export default function Page() {
 
     // Bruit (lit + scanneur)
     const noise = createNoiseNode(ctx); noiseNodeRef.current = noise;
-    const hpN = ctx.createBiquadFilter(); hpN.type = "highpass"; hpN.frequency.value = 140; hpN.Q.value = 0.7;
+    const hpN = ctx.createBiquadFilter(); hpN.type = "highpass"; hpN.frequency.value = 130; hpN.Q.value = 0.7;
     const bp  = ctx.createBiquadFilter(); bp.type = "bandpass"; bp.Q.value = 0.55; bp.frequency.value = 1600;
     const lpN = ctx.createBiquadFilter(); lpN.type = "lowpass";  lpN.frequency.value = 5200; lpN.Q.value = 0.3;
     noiseHPRef.current = hpN; noiseBPRef.current = bp; noiseLPRef.current = lpN;
@@ -263,7 +263,6 @@ export default function Page() {
     // câblage
     noise.connect(hpN); hpN.connect(bp); bp.connect(lpN); lpN.connect(gNoise); gNoise.connect(sum);
     // radio: src → HP → LP → gRadio → sum
-    // (chaîné dynamiquement dans attachMedia)
     gRadio.connect(sum);
 
     // Sorties & effets
@@ -284,8 +283,8 @@ export default function Page() {
   function applyAutoFilterProfile() {
     const ctx = ctxRef.current; if (!AUTO_FILTER || !ctx || !radioHPRef.current) return;
     const now = ctx.currentTime;
-    const hpF = 200 + Math.random() * 180;   // plus neutre
-    const lpF = 5200 + Math.random() * 1800; // plus ouvert
+    const hpF = 200 + Math.random() * 180;   // neutre
+    const lpF = 5200 + Math.random() * 1800; // ouvert
     try {
       radioHPRef.current.frequency.setTargetAtTime(hpF, now, 0.08);
       radioLPRef.current.frequency.setTargetAtTime(lpF, now, 0.08);
@@ -324,27 +323,48 @@ export default function Page() {
       }
     } catch {}
 
-    setCompat(true); // on entendra via <audio>, mais sans analyse (qu’on n’utilise plus)
+    setCompat(true); // on entendra via <audio>, sans analyse (non utilisée)
   }
 
-  /* ===== Lit de bruit modulé (fond) ===== */
+  /* ===== Lit de bruit modulé (fond — profil “parfait”) ===== */
   function startNoiseBed() {
     stopNoiseBed();
+    let f = 1500 + Math.random() * 1200;   // centre du band-pass
+    let q = 0.5;                            // Q de départ
     const loop = () => {
       if (!noiseGainRef.current || !ctxRef.current) return;
       if (!marche) return;
-      if (inBurstRef.current) { noiseBedTimerRef.current = setTimeout(loop, 160); return; }
+
+      // pas de poussée de lit pendant l’impulsion
+      if (inBurstRef.current) { noiseBedTimerRef.current = setTimeout(loop, 140); return; }
+
       const ctx = ctxRef.current;
       const now = ctx.currentTime;
-      const base = BASE_NOISE;
-      const depth = 0.002 + bruit * 0.010; // +/- variation
-      const target = Math.max(0, base + (Math.random() * 2 - 1) * depth);
+
+      // Variation douce d’amplitude (random walk)
+      const depth = 0.0012 + bruit * 0.0065; // amplitude de modulation
+      const target = Math.max(0, BASE_NOISE + (Math.random() * 2 - 1) * depth);
+
       try {
         const g = noiseGainRef.current.gain;
         g.cancelScheduledValues(now);
-        g.setTargetAtTime(target, now, 0.22); // glisse douce
+        g.setTargetAtTime(target, now, 0.28); // glisse lente
       } catch {}
-      noiseBedTimerRef.current = setTimeout(loop, 240 + Math.random() * 420);
+
+      // Micro-oscillation de la bande (texture organique)
+      try {
+        f += (Math.random() * 2 - 1) * (60 + 220 * (0.5 + bruit));
+        f = Math.min(3600, Math.max(900, f));
+        q += (Math.random() * 2 - 1) * 0.06;
+        q = Math.min(0.9, Math.max(0.35, q));
+
+        noiseBPRef.current.Q.setTargetAtTime(q, now, 0.25);
+        noiseBPRef.current.frequency.setTargetAtTime(f, now, 0.25);
+        noiseLPRef.current.frequency.setTargetAtTime(4800 + bruit * 1800, now, 0.25);
+        noiseHPRef.current.frequency.setTargetAtTime(130 + bruit * 160, now, 0.25);
+      } catch {}
+
+      noiseBedTimerRef.current = setTimeout(loop, 180 + Math.random() * 340);
     };
     loop();
   }
@@ -376,7 +396,7 @@ export default function Page() {
     playingLockRef.current = false;
   }
 
-  /* ===== Clic + Impulsions de scan ===== */
+  /* ===== Clic & impulsions au scan ===== */
   function triggerClick(level = 0.24) {
     const ctx = ctxRef.current; if (!ctx || !clickBusRef.current) return;
     const dur = 0.011;
@@ -389,6 +409,7 @@ export default function Page() {
           g.gain.exponentialRampToValueAtTime(0.0001, now + dur); } catch {}
     src.connect(g); src.start();
   }
+
   function playScanBurst(targetGain, durSec) {
     const ctx = ctxRef.current; if (!ctx) return;
     const now = ctx.currentTime;
@@ -397,37 +418,37 @@ export default function Page() {
 
     inBurstRef.current = true;
 
-    const q   = 0.35 + bruit * 0.45;
-    const lpF = 4200 + bruit * 1600;
-    const hpF = 140  + bruit * 180;
-    try {
-      bp.Q.setTargetAtTime(q, now, 0.05);
-      lp.frequency.setTargetAtTime(lpF, now, 0.08);
-      hp.frequency.setTargetAtTime(hpF, now, 0.08);
-    } catch {}
+    // Profil de bande “whoosh”
+    const f0 = 900  + Math.random()*600;
+    const f1 = 1400 + Math.random()*900;
+    const f2 = 2200 + Math.random()*1200;
 
-    const fStart = 700  + Math.random()*700;
-    const fMid   = 1200 + Math.random()*1200;
-    const fEnd   = 1800 + Math.random()*1400;
-    const steps  = Math.max(4, Math.floor(durSec * 10));
+    const steps  = Math.max(5, Math.floor(durSec * 12));
     for (let i = 0; i <= steps; i++) {
       const t = now + (durSec * i) / steps;
       const x = i / steps;
-      const f = (x < 0.6) ? fStart + (fMid - fStart) * (x / 0.6)
-                          : fMid   + (fEnd - fMid)   * ((x - 0.6) / 0.4);
-      const jitter = (Math.random()*2 - 1) * (80 + 280*(1 - bruit));
-      try { bp.frequency.linearRampToValueAtTime(Math.max(300, f + jitter), t); } catch {}
+      const f = (x < 0.55) ? f0 + (f1 - f0) * (x / 0.55)
+                           : f1 + (f2 - f1) * ((x - 0.55) / 0.45);
+      const jitter = (Math.random()*2 - 1) * (60 + 220*(1 - bruit));
+      try {
+        bp.frequency.linearRampToValueAtTime(Math.max(300, f + jitter), t);
+        const q = 0.42 + 0.28 * Math.sin(x * Math.PI); // se resserre puis s’ouvre
+        bp.Q.linearRampToValueAtTime(q, t);
+      } catch {}
     }
 
     try {
+      const attack = Math.min(0.035, durSec * 0.2);
       g.cancelScheduledValues(now);
-      const attack = Math.min(0.04, durSec * 0.22);
       g.setValueAtTime(BASE_NOISE, now);
-      g.linearRampToValueAtTime(targetGain * (0.38 + 0.14*Math.random()), now + attack);
-      g.linearRampToValueAtTime(BASE_NOISE, now + durSec + 0.04);
+      g.linearRampToValueAtTime(targetGain * (0.36 + 0.16*Math.random()), now + attack);
+      g.linearRampToValueAtTime(BASE_NOISE, now + durSec + 0.05);
+
+      // encadrement HF/BF dynamique
+      hp.frequency.setTargetAtTime(140 + bruit * 160, now, 0.05);
+      lp.frequency.setTargetAtTime(4800 + bruit * 1800, now, 0.05);
     } catch {}
 
-    // fin de burst → on rend la main au lit de bruit
     setTimeout(() => { inBurstRef.current = false; }, Math.max(80, durSec * 1000 + 60));
   }
 
@@ -546,7 +567,7 @@ export default function Page() {
     } catch {}
   }
 
-  /* ===== Balayage (sans garde-voix) ===== */
+  /* ===== Balayage (continu) ===== */
   function startSweep() {
     stopSweep();
     const tick = async () => {
