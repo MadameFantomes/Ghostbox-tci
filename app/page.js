@@ -1,4 +1,4 @@
- "use client";
+"use client";
 
 /**
  * Ghostbox TCI — FR (refonte propre)
@@ -79,6 +79,10 @@ export default function Page() {
   const sweepTimerRef = useRef(null);
   const playingLockRef = useRef(false);
 
+  // --- LOG minimal (carnet de labo) ---
+  const logRef = useRef([]);
+  const bcRef = useRef(null);
+
   // Contrôles
   const [vitesse, setVitesse] = useState(0.45); // 250..2500 ms
   const [volume, setVolume] = useState(0.9);
@@ -97,6 +101,46 @@ export default function Page() {
   const burstMs = () => Math.round(120 + debit * 520); // 120..640 ms
   const burstGain = () => Math.min(0.4, 0.08 + debit * 0.32); // plafonné à ~0.40
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+  // ------- LOG : BroadcastChannel + helpers -------
+  useEffect(() => {
+    try { bcRef.current = new BroadcastChannel("labo-ghostbox"); } catch {}
+    return () => { try { bcRef.current?.close(); } catch {} };
+  }, []);
+
+  function addLog(event, extra = {}) {
+    const entry = {
+      timestamp: new Date().toISOString(),
+      event,
+      vitesse, volume, debit, echo,
+      station: stationsRef.current[idxRef.current]?.name || null,
+      ...extra,
+    };
+    logRef.current.push(entry);
+    // localStorage append
+    try {
+      const key = "ghostbox.logs";
+      const prev = JSON.parse(localStorage.getItem(key) || "[]");
+      prev.push(entry);
+      localStorage.setItem(key, JSON.stringify(prev));
+    } catch {}
+    // diffusion temps réel au carnet (onglet abonné)
+    try { bcRef.current?.postMessage(entry); } catch {}
+  }
+
+  function exportLog() {
+    try {
+      const blob = new Blob([JSON.stringify(logRef.current, null, 2)], { type: "application/json" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `ghostbox-log-${new Date().toISOString().replace(/[:.]/g, "-")}.json`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+    } catch {}
+  }((r) => setTimeout(r, ms));
 
   // ------- Charger /stations.json -------
   useEffect(() => {
@@ -373,9 +417,11 @@ export default function Page() {
     await initAudio();
     const ctx = ctxRef.current;
     if (ctx.state === "suspended") await ctx.resume();
-    try {
-      noiseGainRef.current.gain.value = BASE_NOISE;
-    } catch {}
+    try { noiseGainRef.current.gain.value = BASE_NOISE; } catch {}
+    addLog("power_on");
+    await playIndex(idxRef.current);
+    setMarche(true);
+  } catch {}
     await playIndex(idxRef.current);
     setMarche(true);
   }
@@ -383,29 +429,16 @@ export default function Page() {
   async function powerOff() {
     stopSweep();
     const el = audioElRef.current;
-    try {
-      noiseGainRef.current.gain.value = 0;
-    } catch {}
-    if (el) {
-      el.pause();
-      el.src = "";
-      el.load();
-    }
+    try { noiseGainRef.current.gain.value = 0; } catch {}
+    if (el) { el.pause(); el.src = ""; el.load(); }
     if (attachMedia._cleanup) attachMedia._cleanup();
-
-    if (enr) {
-      try {
-        recRef.current?.stop();
-      } catch {}
-      setEnr(false);
-    }
-    try {
-      await ctxRef.current?.suspend();
-    } catch {}
+    if (enr) { try { recRef.current?.stop(); } catch {}; setEnr(false); }
+    try { await ctxRef.current?.suspend(); } catch {}
     setMarche(false);
     setAuto(false);
     setEtat("arrêté");
     playingLockRef.current = false;
+    addLog("power_off");
   }
 
   // petit “clic” discret
@@ -511,6 +544,7 @@ export default function Page() {
 
     playScanBurst(targetNoise, dur);
     setEtat("balayage…");
+    addLog("scan_burst", { targetNoise, dur });
     await sleep(Math.max(100, dur * 600));
 
     // 2) charger / jouer
@@ -538,6 +572,7 @@ export default function Page() {
       idxRef.current = startIndex;
       setIdx(startIndex);
       setEtat(compat ? "lecture (compatibilité)" : "lecture");
+      addLog("play_station", { url, compat });
     } catch {
       try {
         noiseGainRef.current.gain.setTargetAtTime(BASE_NOISE, ctx.currentTime + 0.05, 0.12);
@@ -673,8 +708,9 @@ export default function Page() {
                   v ? await powerOn() : await powerOff();
                 }}
               />
-              <Switch label="BALAYAGE AUTO" on={auto} onChange={(v) => setAuto(v)} />
-              <Bouton label={enr ? "STOP ENREG." : "ENREGISTRER"} onClick={toggleEnr} color={enr ? "#f0c14b" : "#d96254"} />
+              <Switch label="BALAYAGE AUTO" on={auto} onChange={(v) => { setAuto(v); addLog(v ? "auto_on" : "auto_off"); }} />
+              <Bouton label={enr ? "STOP ENREG." : "ENREGISTRER"} onClick={() => { toggleEnr(); addLog(enr ? "rec_stop" : "rec_start"); }} color={enr ? "#f0c14b" : "#d96254"} />
+              <Bouton label="Exporter log" onClick={exportLog} color="#e2d9c6" />
             </div>
             <div style={styles.knobs}>
               <Knob label="VITESSE" value={vitesse} onChange={(v) => setVitesse(clamp01(v))} hint={`${msFromSpeed(vitesse)} ms`} />
