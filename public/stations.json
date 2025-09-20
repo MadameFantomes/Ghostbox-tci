@@ -1,48 +1,25 @@
-{
-  "France": [
-    { "name": "France Inter",      "url": "https://icecast.radiofrance.fr/franceinter-midfi.mp3" },
-    { "name": "France Culture",    "url": "https://icecast.radiofrance.fr/franceculture-midfi.mp3" },
-    { "name": "France Musique",    "url": "https://icecast.radiofrance.fr/francemusique-midfi.mp3" },
-    { "name": "franceinfo",        "url": "https://icecast.radiofrance.fr/franceinfo-midfi.mp3" },
-    { "name": "Mouv'",             "url": "https://icecast.radiofrance.fr/mouv-midfi.mp3" },
-    { "name": "Mouv' Rap Français","url": "https://icecast.radiofrance.fr/mouvrapfr-midfi.mp3" },
+[
+  { "name": "France Info",     "url": "https://icecast.radiofrance.fr/franceinfo-midfi.mp3" },
+  { "name": "France Inter",    "url": "https://icecast.radiofrance.fr/franceinter-midfi.mp3" },
+  { "name": "France Culture",  "url": "https://icecast.radiofrance.fr/franceculture-midfi.mp3" },
+  { "name": "FIP",             "url": "https://icecast.radiofrance.fr/fip-midfi.mp3" },
+  { "name": "FIP Jazz",        "url": "https://icecast.radiofrance.fr/fipjazz-midfi.mp3" },
+  { "name": "FIP Rock",        "url": "https://icecast.radiofrance.fr/fiprock-midfi.mp3" },
+  { "name": "FIP Groove",      "url": "https://icecast.radiofrance.fr/fipgroove-midfi.mp3" },
+  { "name": "Le Mouv’",        "url": "https://icecast.radiofrance.fr/mouv-midfi.mp3" },
 
-    { "name": "TSF Jazz",          "url": "https://tsfjazz.ice.infomaniak.ch/tsfjazz-high.mp3" },
-    { "name": "Radio Meuh",        "url": "https://radiomeuh.ice.infomaniak.ch/radiomeuh-128.mp3" },
-    { "name": "Radio Nova",        "url": "https://nova-stream-01.ice.infomaniak.ch/nova-128.mp3" },
-    { "name": "Radio Nova (NovaZZ)","url": "https://novazz.ice.infomaniak.ch/novazz-128.mp3" },
+  { "name": "Europe 1",        "url": "https://stream.europe1.fr/europe1.mp3" },
+  { "name": "RMC",             "url": "https://rmc.bfmtv.com/rmcinfo-mp3" },
+  { "name": "RTL",             "url": "https://streaming.radio.rtl.fr/rtl-1-44-128" },
+  { "name": "RTL2",            "url": "https://streaming.radio.rtl2.fr/rtl2-1-44-128" },
+  { "name": "Fun Radio",       "url": "https://streaming.radio.funradio.fr/fun-1-44-128" },
 
-    { "name": "Skyrock",           "url": "https://icecast.skyrock.net/s/natio_mp3_128k" },
-    { "name": "OUI FM",            "url": "https://stream.ouifm.fr/ouifm-high.mp3" },
-    { "name": "NRJ France",        "url": "https://scdn.nrjaudio.fm/adwz1/fr/30001/mp3_128.mp3" },
-    { "name": "Fun Radio",         "url": "https://streaming.radio.funradio.fr/fun-1-44-128" },
-    { "name": "RTL2",              "url": "https://streaming.radio.rtl2.fr/rtl2-1-44-128" },
-    { "name": "RFM",               "url": "https://stream6.radiomonitor.com/RFM_128" },
+  { "name": "Sud Radio",       "url": "https://start-sud.ice.infomaniak.ch/start-sud-high.mp3" },
+  { "name": "Radio Classique", "url": "https://radioclassique.ice.infomaniak.ch/radioclassique-high.mp3" },
 
-    { "name": "RTL (info & talk)",     "url": "https://icecast.rtl.fr/rtl-1-44-128" },
-    { "name": "RMC (info/talk/sport)", "url": "https://audio.bfmtv.com/rmcradio_128.mp3" },
-    { "name": "BFM Business (éco)",    "url": "https://audio.bfmtv.com/bfmbusiness_128.mp3" },
-    { "name": "Sud Radio (talk)",      "url": "https://start-sud.ice.infomaniak.ch/start-sud-high.mp3" },
-    { "name": "RFI Monde",             "url": "https://rfimonde64k.ice.infomaniak.ch/rfimonde-64.mp3" },
-    { "name": "France Bleu Paris",     "url": "https://direct.francebleu.fr/live/fb1071-midfi.mp3" }
-  ],
-
-  "Belgique (RTBF)": [
-    { "name": "Classic 21",   "url": "https://icecast.rtbf.be/classic21-128.mp3" },
-    { "name": "La Première",  "url": "https://icecast.rtbf.be/lapremiere-128.mp3" },
-    { "name": "Tipik",        "url": "https://icecast.rtbf.be/tipik-128.mp3" },
-    { "name": "VivaCité",     "url": "https://icecast.rtbf.be/vivacite-128.mp3" },
-    { "name": "Musiq3",       "url": "https://icecast.rtbf.be/musiq3-128.mp3" }
-  ],
-
-  "International (News/Talk)": [
-    { "name": "BBC World Service (EN)", "url": "https://stream.live.vc.bbcmedia.co.uk/bbc_world_service" },
-
-  "Indés / Monde": [
-    { "name": "Radio Paradise Main (AAC 320)",   "url": "https://stream.radioparadise.com/aac-320" },
-    { "name": "Radio Paradise Mellow (AAC 320)", "url": "https://stream.radioparadise.com/mellow-320" },
-    { "name": "Radio Paradise Rock (AAC 320)",   "url": "https://stream.radioparadise.com/rock-320" },
-    { "name": "Radio Paradise World (AAC 320)",  "url": "https://stream.radioparadise.com/world-320" },
-
-  ]
-}
+  { "name": "RFI Monde",       "url": "https://live02.rfi.fr/rfimonde-64.mp3" },
+  { "name": "France Musique",  "url": "https://icecast.radiofrance.fr/francemusique-midfi.mp3" },
+  { "name": "France Bleu Paris","url": "https://icecast.radiofrance.fr/francebleuparis-midfi.mp3" },
+  { "name": "France Bleu Occitanie","url": "https://icecast.radiofrance.fr/francebleuoccitanie-midfi.mp3" },
+  { "name": "FIP Monde (alt)", "url": "https://icecast.radiofrance.fr/fip-webradio7.mp3" }
+]
