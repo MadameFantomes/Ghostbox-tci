@@ -1,11 +1,12 @@
 "use client";
 
 /**
- * Ghostbox TCI — FR (vintage + sliders + MP3 via CDN + MODE KÖNIG, skip optionnel)
+ * Ghostbox TCI — FR (vintage + sliders + MP3 via CDN + MODE KÖNIG adouci)
  * - Enreg. MP3 (MediaRecorder si possible, sinon lamejs via CDN)
- * - Balayage corrigé (hard reset + cache-bust + wait canplay + écho muet pendant le scan)
+ * - Balayage corrigé : hard reset + cache-bust + wait canplay + écho muet pendant le scan
+ * - Anti-répétition : prérôlage ~1 s avant la montée + cooldown station 15 s
  * - UI vintage (sliders) • RALENTI (lecture + intervalle)
- * - MODE KÖNIG : ring-mod + LPF, multi-porteuses battements (doux), skip musique optionnel et non-bloquant
+ * - MODE KÖNIG : ring-mod + LPF, multi-porteuses (très doux) — radio au premier plan
  * - Charge /public/stations.json sinon fallback FR
  */
 
@@ -79,7 +80,6 @@ export default function Page() {
   const kngLORef = useRef({ f: 5500, p: 0 }); // LO (Hz + phase)
   const kngOscBusRef = useRef(null);   // bus multi-porteuses
   const kngOscListRef = useRef([]);    // oscillateurs + LFOs
-  const kngAnalyserRef = useRef(null); // Analyser pour skip musique
   const kngEnabledRef = useRef(false);
 
   // Stations / index
@@ -95,7 +95,6 @@ export default function Page() {
   const [compat, setCompat] = useState(false);
   const [lent, setLent] = useState(false);
   const [kng, setKng] = useState(false);     // MODE KÖNIG (traitement)
-  const [kngSkip, setKngSkip] = useState(false); // Skip musique optionnel
   const sweepTimerRef = useRef(null);
   const playingLockRef = useRef(false);
 
@@ -119,6 +118,9 @@ export default function Page() {
   const logRef = useRef([]);
   const bcRef = useRef(null);
 
+  // Anti-répétition / cooldown
+  const lastTuneRef = useRef(new Map()); // url -> timestamp ms
+
   // Helpers
   const clamp01 = (x) => Math.max(0, Math.min(1, x));
   const msFromSpeed = (v) => Math.round(250 + v * (2500 - 250));
@@ -130,13 +132,8 @@ export default function Page() {
 
   // --- anti-boucle / anti-cache ---
   const cacheBust = (u) => {
-    try {
-      const url = new URL(u);
-      url.searchParams.set("gbx", Date.now().toString(36));
-      return url.toString();
-    } catch {
-      return u + (u.includes("?") ? "&" : "?") + "gbx=" + Date.now().toString(36);
-    }
+    try { const url = new URL(u); url.searchParams.set("gbx", Date.now().toString(36)); return url.toString(); }
+    catch { return u + (u.includes("?") ? "&" : "?") + "gbx=" + Date.now().toString(36); }
   };
   async function hardStop(el) {
     if (!el) return;
@@ -164,7 +161,7 @@ export default function Page() {
   function addLog(event, extra = {}) {
     const entry = {
       timestamp: new Date().toISOString(),
-      event, vitesse, lent, kng, kngSkip, volume, echo,
+      event, vitesse, lent, kng, volume, echo,
       station: stationsRef.current[idxRef.current]?.name || null,
       ...extra,
     };
@@ -352,7 +349,7 @@ export default function Page() {
     }
   }
 
-  // ------- MODE KÖNIG impl -------
+  // ------- MODE KÖNIG impl (adouci) -------
   function kngEnable() {
     if (kngEnabledRef.current) return;
     const ctx = ctxRef.current; if (!ctx || !sumRef.current || !masterRef.current) return;
@@ -362,7 +359,7 @@ export default function Page() {
     const wet = ctx.createGain(); wet.gain.value = 0; // mix traité
     const lo = kngLORef.current; lo.f = 5500; lo.p = 0;
 
-    const fc = 2200; // LPF un peu plus haut (consonnes)
+    const fc = 2400; // un peu plus haut pour garder les consonnes
     const alpha = 1 - Math.exp(-2 * Math.PI * fc / ctx.sampleRate);
     let yL = 0, yR = 0;
 
@@ -377,8 +374,7 @@ export default function Page() {
       for (let n = 0; n < iL.length; n++) {
         const s = Math.sin(phase);
         phase += inc; if (phase > 1e9) phase = phase % (2 * Math.PI);
-        const mL = iL[n] * s;
-        const mR = iR[n] * s;
+        const mL = iL[n] * s, mR = iR[n] * s;
         yL = yL + alpha * (mL - yL); // 1-pole LPF
         yR = yR + alpha * (mR - yR);
         oL[n] = yL; oR[n] = yR;
@@ -389,36 +385,33 @@ export default function Page() {
     sumRef.current.connect(proc); proc.connect(wet); wet.connect(masterRef.current);
     kngProcRef.current = proc; kngWetRef.current = wet;
 
-    // 2) Multi-porteuses + battements (beaucoup plus doux)
-    const bus = ctx.createGain(); bus.gain.value = 0.08; // global carriers
+    // montée très douce du mix traité (faible)
+    try { wet.gain.setTargetAtTime(0.12, ctx.currentTime, 0.15); } catch {}
+
+    // 2) Multi-porteuses + battements (très doux)
+    const bus = ctx.createGain(); bus.gain.value = 0.04; // global carriers
     bus.connect(sumRef.current); kngOscBusRef.current = bus;
 
     const freqs = [1700, 2300, 3100, 5000, 8500];
     const oscList = [];
     freqs.forEach((f) => {
       const osc = ctx.createOscillator(); osc.type = "sine"; osc.frequency.value = f;
-      const g = ctx.createGain(); g.gain.value = 0.003; // base très faible
+      const g = ctx.createGain(); g.gain.value = 0.002; // base minuscule
       osc.connect(g); g.connect(bus);
 
       // LFO lent 0.2..1.8 Hz — modulation d'amplitude
       const lfo = ctx.createOscillator(); lfo.type = "sine"; lfo.frequency.value = 0.2 + Math.random() * 1.6;
-      const lfoAmp = ctx.createGain(); lfoAmp.gain.value = 0.002; // profondeur
+      const lfoAmp = ctx.createGain(); lfoAmp.gain.value = 0.0015; // profondeur
       lfo.connect(lfoAmp); lfoAmp.connect(g.gain);
 
       // Offset DC pour part constante
-      const base = ctx.createConstantSource(); base.offset.value = 0.002; base.connect(g.gain); base.start();
+      const base = ctx.createConstantSource(); base.offset.value = 0.0015; base.connect(g.gain); base.start();
 
       try { osc.start(); lfo.start(); } catch {}
       oscList.push({ osc, g, lfo, lfoAmp, base });
     });
     kngOscListRef.current = oscList;
 
-    // 3) Analyser (pour skip musique si activé)
-    const an = ctx.createAnalyser(); an.fftSize = 1024; an.smoothingTimeConstant = 0;
-    kngAnalyserRef.current = an; try { radioGainRef.current.connect(an); } catch {}
-
-    // montée douce du mix traité (plus faible)
-    try { wet.gain.setTargetAtTime(0.22, ctx.currentTime, 0.15); } catch {}
     kngEnabledRef.current = true; addLog("koenig_on");
   }
   function kngDisable() {
@@ -447,10 +440,6 @@ export default function Page() {
       kngOscBusRef.current?.disconnect();
       kngOscBusRef.current = null;
     } catch {}
-
-    // analyser
-    try { radioGainRef.current?.disconnect(kngAnalyserRef.current); } catch {}
-    kngAnalyserRef.current = null;
 
     kngEnabledRef.current = false; addLog("koenig_off");
   }
@@ -513,28 +502,6 @@ export default function Page() {
     } catch {}
   }
 
-  // ------- Évaluation station (skip musique pour MODE KÖNIG) -------
-  async function kngEvaluateStation(msWindow = 700, frames = 10) {
-    const an = kngAnalyserRef.current; if (!kng || !kngSkip || !an) return { keep: true, score: 0 };
-    const arr = new Float32Array(an.frequencyBinCount);
-    let sumFlat = 0;
-    for (let i = 0; i < frames; i++) {
-      an.getFloatFrequencyData(arr);
-      // convert dB -> amplitude linéaire
-      let gm = 0, am = 0, count = 0;
-      for (let k = 4; k < arr.length; k++) {
-        const m = Math.max(1e-8, Math.pow(10, arr[k] / 20));
-        am += m; gm += Math.log(m); count++;
-      }
-      gm = Math.exp(gm / count); am = am / count;
-      const flat = gm / am; // 0..1 (tonal -> bas, bruité -> haut)
-      sumFlat += flat;
-      await sleep(msWindow / frames);
-    }
-    const meanFlat = sumFlat / frames;
-    return { keep: meanFlat >= 0.32, score: meanFlat };
-  }
-
   // ------- Lecture robuste -------
   async function playIndex(startIndex, tries = 0) {
     const list = stationsRef.current; if (!list.length) return;
@@ -543,6 +510,15 @@ export default function Page() {
 
     const el = audioElRef.current;
     const entry = list[startIndex]; const url = typeof entry === "string" ? entry : entry.url;
+
+    // Cooldown : éviter de revenir sur la même station trop vite (15 s)
+    const nowMs = Date.now();
+    const last = lastTuneRef.current.get(url) || 0;
+    if (auto && nowMs - last < 15000) {
+      playingLockRef.current = false;
+      return await playIndex((startIndex + 1) % list.length, tries + 1);
+    }
+
     const ctx = ctxRef.current; const now = ctx.currentTime;
     const dur = burstMs() / 1000; const targetNoise = burstGain();
 
@@ -582,32 +558,23 @@ export default function Page() {
       await attachMedia();
       applyAutoFilterProfile();
 
-      // 2b) MODE KÖNIG : évaluation asynchrone optionnelle (ne bloque pas la montée)
-      if (kng && kngSkip && auto) {
-        const myIndex = startIndex;
-        setTimeout(async () => {
-          const ev = await kngEvaluateStation(650, 8);
-          addLog("kng_eval", { flatness: Number((ev?.score ?? 0).toFixed(3)), keep: !!ev?.keep });
-          if (!ev?.keep && marche && auto && idxRef.current === myIndex) {
-            const next = (myIndex + 1) % stationsRef.current.length;
-            await playIndex(next);
-          }
-        }, 800);
-      }
-
-      // 3) retour
-      const after = ctx.currentTime + Math.max(0.06, dur * 0.45);
+      // 3) retour — prérôlage (~0.9–1.3 s) pour éviter d’entendre toujours le même “mot de tête”
+      const prerollMs = 900 + Math.random() * 400;
+      const after = ctx.currentTime + Math.max(0.10, dur * 0.55) + (prerollMs / 1000);
       try {
         noiseGainRef.current.gain.setTargetAtTime(BASE_NOISE, after, 0.1);
         if (!compat) radioGainRef.current.gain.setTargetAtTime(1, after, 0.07);
         else el.volume = clamp01(volume);
-        // rétablir l'écho selon le slider (pas le précédent wet)
+        // rétablir l'écho selon le slider
         echoWetRef.current.gain.setTargetAtTime(echo * 0.9, after + 0.05, 0.12);
       } catch {}
 
       idxRef.current = startIndex; setIdx(startIndex);
       setEtat(compat ? "lecture (compatibilité)" : "lecture");
       addLog("play_station", { url, compat });
+
+      // mémoriser le dernier tuning
+      lastTuneRef.current.set(url, Date.now());
     } catch {
       try {
         noiseGainRef.current.gain.setTargetAtTime(BASE_NOISE, ctx.currentTime + 0.05, 0.12);
@@ -815,7 +782,6 @@ export default function Page() {
               <Switch label="BALAYAGE AUTO" on={auto} onChange={(v) => { setAuto(v); addLog(v ? "auto_on" : "auto_off"); }} />
               <Switch label="RALENTI" on={lent} onChange={(v) => { setLent(v); addLog(v ? "slow_on" : "slow_off"); }} />
               <Switch label="MODE KÖNIG" on={kng} onChange={(v) => setKng(v)} />
-              <Switch label="SKIP MUSIQUE (KÖNIG)" on={kngSkip} onChange={(v) => setKngSkip(v)} />
 
               <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
                 <Bouton label={enr ? "STOP ENREG." : "ENREGISTRER"} onClick={toggleEnr} color={enr ? "#f0c14b" : "#c76d4b"} />
@@ -840,7 +806,7 @@ export default function Page() {
       </div>
 
       <p style={{ color: "rgba(60,40,20,0.85)", marginTop: 10, fontSize: 12 }}>
-        Mode KÖNIG traité en douceur; “Skip musique” est séparé (optionnel). MP3 via CDN ok.
+        KÖNIG doux (radio devant) • Prérôlage anti-répétition • Cooldown stations 15s • MP3 via CDN.
       </p>
     </main>
   );
