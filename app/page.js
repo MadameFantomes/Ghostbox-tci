@@ -1,23 +1,23 @@
 "use client";
 
 /**
- * Ghostbox TCI — FR (corrigé)
- * - FIX: branchement radio -> somme (on n'entendait que le bruit)
- * - Balayage direct, cache-bust, anti-boucle
- * - Garde-voix (détection parole) + Maintien
+ * Ghostbox TCI — FR (sans banque de voix)
+ * - Balayage direct + bruit modulé + clic
+ * - Garde-voix (détection de parole) + Maintien
  * - Convolver “haut-parleur vintage”
- * - Biais PARLÉ (news/talk + weight)
- * - Failsafe: ajoute un lot de stations PARLÉ en MP3 si la liste jouable est trop faible
+ * - Biais PARLÉ (type:"news|talk" + weight)
+ * - LIVE+ (option) : ajoute des radios parlées MP3/HTTPS via RadioBrowser
+ * - Anti-boucle (watchdog), cache-bust, enregistrement MP3/WAV
  */
 
 import React, { useEffect, useRef, useState } from "react";
 
-/* ===== Détection codecs (filtrer MP3/AAC jouables) ===== */
-const audioProbe = typeof Audio !== "undefined" ? new Audio() : null;
-const SUPPORT_MP3 = !!audioProbe?.canPlayType?.("audio/mpeg");
+/* ===== Détection codecs ===== */
+const probe = typeof Audio !== "undefined" ? new Audio() : null;
+const SUPPORT_MP3 = !!probe?.canPlayType?.("audio/mpeg");
 const SUPPORT_AAC = !!(
-  audioProbe?.canPlayType?.("audio/aac") ||
-  audioProbe?.canPlayType?.('audio/mp4; codecs="mp4a.40.2"')
+  probe?.canPlayType?.("audio/aac") ||
+  probe?.canPlayType?.('audio/mp4; codecs="mp4a.40.2"')
 );
 function guessCodec(url = "") {
   const L = url.toLowerCase();
@@ -29,14 +29,12 @@ function guessCodec(url = "") {
 /* ===== Réglages & Fallbacks ===== */
 const AUTO_FILTER = true;
 
-// Mini fallback de base
 const FALLBACK_STATIONS = [
   "https://icecast.radiofrance.fr/fip-midfi.mp3",
   "https://icecast.radiofrance.fr/franceinfo-midfi.mp3",
   "https://tsfjazz.ice.infomaniak.ch/tsfjazz-high.mp3"
 ].map((url) => ({ name: new URL(url).host, url }));
 
-// Lot PARLÉ MP3 (failsafe) — direct & HTTPS
 const CURATED_TALK_MP3 = [
   { name: "franceinfo", url: "https://icecast.radiofrance.fr/franceinfo-midfi.mp3", type: "news", lang: "fr", weight: 3 },
   { name: "France Inter", url: "https://icecast.radiofrance.fr/franceinter-midfi.mp3", type: "talk", lang: "fr", weight: 2 },
@@ -49,10 +47,17 @@ const CURATED_TALK_MP3 = [
   { name: "WNYC FM", url: "https://stream.wnyc.org/wnycfm", type: "talk", lang: "en", weight: 2 }
 ];
 
+/* ===== Utils ===== */
+const clamp01 = (x) => Math.max(0, Math.min(1, x));
+const shuffleInPlace = (a) => { for (let i=a.length-1;i>0;i--){ const j=Math.floor(Math.random()*(i+1)); [a[i],a[j]]=[a[j],a[i]]; } return a; };
+const dedupByUrl = (arr) => { const seen=new Set(); return arr.filter(s => (s && s.url && !seen.has(s.url) ? (seen.add(s.url), true) : false)); };
+const nowMs = () => performance.now();
+
+/* ===== Composant principal ===== */
 export default function Page() {
   const audioElRef = useRef(null);
 
-  // Audio graph refs
+  // Audio graph
   const ctxRef = useRef(null);
   const masterRef = useRef(null);
   const destRef = useRef(null);
@@ -66,7 +71,7 @@ export default function Page() {
   const convolverRef = useRef(null);
   const radioGainRef = useRef(null);
 
-  // Sum node (pour brancher radio + bruit)
+  // Mix sum
   const sumRef = useRef(null);
 
   // Noise chain
@@ -85,18 +90,18 @@ export default function Page() {
   // Click
   const clickBusRef = useRef(null);
 
-  // Watchdog anti-boucle
+  // Watchdog
   const progressRef = useRef({ lastCT: 0, lastWall: 0, timer: null });
 
-  // Analyse (Garde-voix)
+  // Garde-voix analyse
   const analyserRef = useRef(null);
   const envValRef = useRef(0);
   const envRAFRef = useRef(null);
   const holdUntilRef = useRef(0);
 
   // Stations
-  const [stations, setStations] = useState(FALLBACK_STATIONS); // pour affichage
-  const scanRef = useRef(FALLBACK_STATIONS);                   // pour balayage (pondéré)
+  const [stations, setStations] = useState(FALLBACK_STATIONS); // lisibles (affichage)
+  const scanRef = useRef(FALLBACK_STATIONS);                   // liste pondérée pour le balayage
   const [idx, setIdx] = useState(0);
   const idxRef = useRef(0);
 
@@ -112,7 +117,7 @@ export default function Page() {
   const [vitesse, setVitesse] = useState(0.45); // 250..2500 ms
   const [volume, setVolume]   = useState(0.9);
   const [echo, setEcho]       = useState(0.25);
-  const [bruit, setBruit]     = useState(0.35); // un peu plus doux par défaut
+  const [bruit, setBruit]     = useState(0.35);
 
   // Garde-voix
   const [gardeVoix, setGardeVoix] = useState(true);
@@ -125,17 +130,19 @@ export default function Page() {
   const chunksRef = useRef([]);
   const wavRecRef = useRef({ active: false, proc: null, tap: null, buffersL: [], buffersR: [], length: 0 });
 
-  // Helpers
-  const clamp01 = (x) => Math.max(0, Math.min(1, x));
-  const msFromSpeed = (v) => Math.round(250 + v * (2500 - 250));
+  // LIVE+
+  const [livePlus, setLivePlus] = useState(false);
+  const augmentingRef = useRef(false);
+
+  // Helpers bruit
   const BASE_NOISE = 0.006;
+  const msFromSpeed = (v) => Math.round(250 + v * (2500 - 250));
   const burstMs  = () => Math.round(120 + bruit * 520);
   const burstGain = () => Math.min(0.40, 0.08 + bruit * 0.32);
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   const supportsType = (m) => window.MediaRecorder?.isTypeSupported?.(m) || false;
-  const nowMs = () => performance.now();
 
-  /* ===== Charger stations + filtrage codecs + pondération ===== */
+  /* ===== Charger stations + filtrage + pondération ===== */
   useEffect(() => {
     (async () => {
       const all = [];
@@ -149,47 +156,25 @@ export default function Page() {
       } catch {}
       let flat = all.length ? all : FALLBACK_STATIONS;
 
-      // 1) dédoublonner par URL
-      const dedup = (arr) => {
-        const seen = new Set();
-        return arr.filter((s) => (s && s.url && !seen.has(s.url) ? (seen.add(s.url), true) : false));
-      };
-      flat = dedup(flat);
+      // dédoublonner
+      flat = dedupByUrl(flat);
 
-      // 2) filtrer par codecs jouables
+      // filtrer codecs
       let playable = flat.filter((s) => {
         const c = guessCodec(s.url);
         if (c === "mp3") return SUPPORT_MP3;
         if (c === "aac") return SUPPORT_AAC;
-        return true; // inconnu -> on tente
+        return true;
       });
 
-      // 3) si très peu jouables, injecter le lot PARLÉ MP3 puis redédoublonner
-      if (playable.length < 6) {
-        playable = dedup([...playable, ...CURATED_TALK_MP3]);
-      }
+      // secours si peu de flux
+      if (playable.length < 6) playable = dedupByUrl([...playable, ...CURATED_TALK_MP3]);
 
-      // 4) pondération (favorise PARLÉ)
-      const TALK_TYPES = new Set(["talk", "news"]);
-      const weighted = [];
-      for (const s of playable) {
-        const base = TALK_TYPES.has((s.type || "").toLowerCase()) ? 2 : 1;
-        const w = Math.max(1, Math.min(6, Math.round(s.weight || base)));
-        for (let i = 0; i < w; i++) weighted.push(s);
-      }
-      for (let i = weighted.length - 1; i > 0; i--) {
-        const j = Math.floor(Math.random() * (i + 1));
-        [weighted[i], weighted[j]] = [weighted[j], weighted[i]];
-      }
-
-      // 5) si malgré tout on n’a rien, repli strict sur CURATED_TALK_MP3
+      // pondération PARLÉ
+      const weighted = buildWeighted(playable);
       if (!weighted.length) {
         playable = CURATED_TALK_MP3.slice();
-        for (let i = playable.length - 1; i > 0; i--) {
-          const j = Math.floor(Math.random() * (i + 1));
-          [playable[i], playable[j]] = [playable[j], playable[i]];
-        }
-        playable.forEach((s) => (s.type = s.type || "news"));
+        shuffleInPlace(playable);
         weighted.push(...playable);
       }
 
@@ -228,11 +213,8 @@ export default function Page() {
         });
       });
     }
-    // mélange initial
-    for (let i = out.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [out[i], out[j]] = [out[j], out[i]]; }
-    return out;
+    return shuffleInPlace(out);
   }
-
   function isDirectish(u) {
     try {
       const L = u.toLowerCase();
@@ -242,12 +224,22 @@ export default function Page() {
       return true;
     } catch { return false; }
   }
+  function buildWeighted(playable) {
+    const TALK = new Set(["talk", "news"]);
+    const weighted = [];
+    for (const s of playable) {
+      const base = TALK.has((s.type || "").toLowerCase()) ? 2 : 1;
+      const w = Math.max(1, Math.min(6, Math.round(s.weight || base)));
+      for (let i = 0; i < w; i++) weighted.push(s);
+    }
+    return shuffleInPlace(weighted);
+  }
   function withCacheBust(url) {
     const sep = url.includes("?") ? "&" : "?";
     return `${url}${sep}ghostbox_live=${Date.now()}`;
   }
 
-  /* ===== Init Audio graph (FIX: brancher gRadio -> sum) ===== */
+  /* ===== Init Audio graph ===== */
   async function initAudio() {
     if (ctxRef.current) return;
     const ctx = new (window.AudioContext || window.webkitAudioContext)();
@@ -261,7 +253,7 @@ export default function Page() {
     const dest = ctx.createMediaStreamDestination(); destRef.current = dest;
     master.connect(dest);
 
-    // Radio chain
+    // Radio path
     const hp = ctx.createBiquadFilter();  hp.type = "highpass"; hp.frequency.value = 320; hp.Q.value = 0.7;
     const lp = ctx.createBiquadFilter();  lp.type = "lowpass";  lp.frequency.value = 3400; lp.Q.value = 0.7;
     const shelf = ctx.createBiquadFilter(); shelf.type = "highshelf"; shelf.frequency.value = 2500; shelf.gain.value = -4;
@@ -292,9 +284,10 @@ export default function Page() {
 
     // Somme → master
     const sum = ctx.createGain(); sum.gain.value = 1; sumRef.current = sum;
-    // BRUIT vers somme
+
+    // BRUIT → somme
     noise.connect(hpN); hpN.connect(bp); bp.connect(lpN); lpN.connect(gNoise); gNoise.connect(sum);
-    // *** FIX CRITIQUE *** : RADIO vers somme
+    // RADIO → somme
     gRadio.connect(sum);
 
     // Sorties
@@ -306,6 +299,7 @@ export default function Page() {
     // Analyse pour Garde-voix (tap sur gRadio)
     const ana = ctx.createAnalyser(); ana.fftSize = 1024; ana.smoothingTimeConstant = 0.85;
     analyserRef.current = ana;
+    try { gRadio.connect(ana); } catch {}
   }
 
   function createNoiseNode(ctx) {
@@ -342,7 +336,6 @@ export default function Page() {
     }
     return buf;
   }
-
   function applyAutoFilterProfile() {
     const ctx = ctxRef.current; if (!AUTO_FILTER || !ctx || !radioHPRef.current) return;
     const now = ctx.currentTime;
@@ -358,7 +351,7 @@ export default function Page() {
     } catch {}
   }
 
-  /* ===== Attacher la radio (avec convolver + tap analyse) ===== */
+  /* ===== Attacher la radio ===== */
   async function attachMedia() {
     if (!ctxRef.current || !audioElRef.current) return;
     if (mediaSrcRef.current) return;
@@ -367,16 +360,13 @@ export default function Page() {
     const el = audioElRef.current;
 
     const chainConnect = (srcNode) => {
-      // src → HP → LP → shelf → drive → convolver → gRadio (→ sum déjà câblé)
+      // src → HP → LP → shelf → drive → convolver → gRadio (→ somme déjà câblée)
       srcNode.connect(radioHPRef.current);
       radioHPRef.current.connect(radioLPRef.current);
       radioLPRef.current.connect(radioShelfRef.current);
       radioShelfRef.current.connect(driveRef.current);
       driveRef.current.connect(convolverRef.current);
       convolverRef.current.connect(radioGainRef.current);
-
-      // tap analyse
-      try { radioGainRef.current.connect(analyserRef.current); } catch {}
     };
 
     try {
@@ -398,7 +388,7 @@ export default function Page() {
       }
     } catch {}
 
-    setCompat(true); // pas d’accès flux → on entendra quand même via <audio>, mais pas d’analyse
+    setCompat(true); // pas d’analyse (CORS), mais on entend via <audio>
   }
 
   /* ===== Garde-voix (RMS) ===== */
@@ -645,6 +635,56 @@ export default function Page() {
     sweepTimerRef.current = null;
   }
 
+  /* ===== LIVE+ : ajout auto de radios parlées (RadioBrowser) ===== */
+  useEffect(() => {
+    if (!livePlus) return;
+    if (augmentingRef.current) return;
+    augmentingRef.current = true;
+
+    (async () => {
+      try {
+        const urls = [
+          "https://de1.api.radio-browser.info/json/stations/search?tag=news&hidebroken=true&is_https=true&codec=MP3&limit=200",
+          "https://de1.api.radio-browser.info/json/stations/search?tag=talk&hidebroken=true&is_https=true&codec=MP3&limit=200",
+          "https://de1.api.radio-browser.info/json/stations/search?language=french&hidebroken=true&is_https=true&codec=MP3&limit=150",
+          "https://de1.api.radio-browser.info/json/stations/search?language=english&hidebroken=true&is_https=true&codec=MP3&limit=150"
+        ];
+        const batches = await Promise.allSettled(urls.map(u => fetch(u, { cache: "no-store" })));
+        const found = [];
+        for (const b of batches) {
+          if (b.status !== "fulfilled") continue;
+          const list = await b.value.json();
+          (list || []).forEach(item => {
+            const url = (item?.url_resolved || item?.url || "").trim();
+            if (!/^https:/i.test(url)) return;
+            const L = url.toLowerCase();
+            if (/\.(m3u8|m3u|pls|xspf)(\?|$)/.test(L)) return;
+            found.push({
+              name: item?.name || new URL(url).host,
+              url,
+              type: (item?.tags || "").toLowerCase().includes("news") ? "news" : "talk",
+              lang: item?.language || undefined,
+              weight: 2
+            });
+          });
+        }
+
+        if (found.length) {
+          setStations(prev => {
+            const merged = dedupByUrl([...prev, ...found]);
+            scanRef.current = buildWeighted(merged);
+            setEtat(`LIVE+ ajouté (${merged.length - prev.length})`);
+            return merged;
+          });
+        }
+      } catch {
+        setEtat("LIVE+ indisponible");
+      } finally {
+        augmentingRef.current = false;
+      }
+    })();
+  }, [livePlus]);
+
   /* ===== Enregistrement MP3/WAV ===== */
   function startRecording() {
     if (!destRef.current) return;
@@ -658,6 +698,7 @@ export default function Page() {
       };
       rec.start(); recRef.current = rec; setEnr(true); return;
     }
+    // WAV fallback
     const ctx = ctxRef.current;
     const proc = ctx.createScriptProcessor(4096, 2, 2);
     const tap = ctx.createGain(); tap.gain.value = 1;
@@ -694,7 +735,6 @@ export default function Page() {
     downloadBlob(URL.createObjectURL(blob), "ghostbox.wav");
     setEnr(false);
   }
-
   function downloadBlob(url, filename) { const a = document.createElement("a"); a.href = url; a.download = filename; document.body.appendChild(a); a.click(); setTimeout(() => { document.body.removeChild(a); URL.revokeObjectURL(url); }, 0); }
   function encodeWAV(left, right, sampleRate) {
     const numFrames = left.length; const buffer = new ArrayBuffer(44 + numFrames * 4); const view = new DataView(buffer);
@@ -753,6 +793,7 @@ export default function Page() {
                 <Lamp label="AUTO"   on={auto} colorOn="#86fb6a" />
                 <Lamp label="ENR"    on={enr}  colorOn="#ff5656" />
                 <Lamp label="VOIX"   on={gardeVoix} colorOn="#6ac8ff" />
+                <Lamp label="LIVE+"  on={livePlus} colorOn="#86fb6a" />
               </div>
             </div>
           </div>
@@ -769,7 +810,8 @@ export default function Page() {
             <div style={styles.switches}>
               <Switch label="MARCHE" on={marche} onChange={async v => { setMarche(v); v ? await powerOn() : await powerOff(); }} />
               <Switch label="BALAYAGE AUTO" on={auto} onChange={(v) => setAuto(v)} />
-              <Switch label="GARDE-VOIX (détection de parole)" on={gardeVoix} onChange={(v) => setGardeVoix(v)} />
+              <Switch label="GARDE-VOIX (détection parole)" on={gardeVoix} onChange={(v) => setGardeVoix(v)} />
+              <Switch label="LIVE+ (annuaire)" on={livePlus} onChange={(v) => setLivePlus(v)} />
               <Bouton label={enr ? (supportsType("audio/mpeg") ? "STOP ENREG. (MP3)" : "STOP ENREG. (WAV)") : "ENREGISTRER"} onClick={toggleEnr} color={enr ? "#f0c14b" : "#d96254"} />
             </div>
 
@@ -778,7 +820,7 @@ export default function Page() {
               <Knob label="VOLUME"  value={volume}  onChange={(v) => setVolume(clamp01(v))} />
               <Knob label="ÉCHO"    value={echo}    onChange={(v) => setEcho(clamp01(v))} />
               <Knob label="BRUIT"   value={bruit}   onChange={(v) => setBruit(clamp01(v))} hint={`${burstMs()} ms de bruit`} />
-              <Knob label="SENSIBILITÉ VOIX" value={sensi} onChange={(v) => setSensi(clamp01(v))} />
+              <Knob label="SENSI VOIX" value={sensi} onChange={(v) => setSensi(clamp01(v))} />
               <Knob label="MAINTIEN" value={maintien} onChange={(v) => setMaintien(clamp01(v))} />
             </div>
           </div>
@@ -790,7 +832,7 @@ export default function Page() {
       </div>
 
       <p style={{ color: "rgba(255,255,255,0.8)", marginTop: 10, fontSize: 12 }}>
-        Le Garde-voix suspend le balayage pendant la parole (réglable via Sensibilité & Maintien). La pondération favorise les stations parlées.
+        Le Garde-voix suspend le balayage quand ça parle. <em>LIVE+</em> ajoute automatiquement des flux parlés en direct.
       </p>
     </main>
   );
