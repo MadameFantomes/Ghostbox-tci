@@ -1,13 +1,13 @@
 "use client";
 
 /**
- * Ghostbox TCI — FR
- * - Balayage direct (HLS écarté) + cache-bust + anti-boucle (watchdog)
- * - Bruit de balayage modulé + clic
- * - Garde-voix (détection de parole) + Maintien (retarde le saut quand ça parle)
+ * Ghostbox TCI — FR (corrigé)
+ * - FIX: branchement radio -> somme (on n'entendait que le bruit)
+ * - Balayage direct, cache-bust, anti-boucle
+ * - Garde-voix (détection parole) + Maintien
  * - Convolver “haut-parleur vintage”
- * - Enregistrement MP3 si possible, sinon WAV
- * - Biais parlé : pondération des stations `type:"news|talk"` et champ `weight`
+ * - Biais PARLÉ (news/talk + weight)
+ * - Failsafe: ajoute un lot de stations PARLÉ en MP3 si la liste jouable est trop faible
  */
 
 import React, { useEffect, useRef, useState } from "react";
@@ -26,18 +26,33 @@ function guessCodec(url = "") {
   return "unknown";
 }
 
-/* ===== Réglages ===== */
+/* ===== Réglages & Fallbacks ===== */
 const AUTO_FILTER = true;
+
+// Mini fallback de base
 const FALLBACK_STATIONS = [
   "https://icecast.radiofrance.fr/fip-midfi.mp3",
   "https://icecast.radiofrance.fr/franceinfo-midfi.mp3",
   "https://tsfjazz.ice.infomaniak.ch/tsfjazz-high.mp3"
 ].map((url) => ({ name: new URL(url).host, url }));
 
+// Lot PARLÉ MP3 (failsafe) — direct & HTTPS
+const CURATED_TALK_MP3 = [
+  { name: "franceinfo", url: "https://icecast.radiofrance.fr/franceinfo-midfi.mp3", type: "news", lang: "fr", weight: 3 },
+  { name: "France Inter", url: "https://icecast.radiofrance.fr/franceinter-midfi.mp3", type: "talk", lang: "fr", weight: 2 },
+  { name: "France Culture", url: "https://icecast.radiofrance.fr/franceculture-midfi.mp3", type: "talk", lang: "fr", weight: 2 },
+  { name: "RTL", url: "https://icecast.rtl.fr/rtl-1-44-128", type: "news", lang: "fr", weight: 2 },
+  { name: "RMC", url: "https://audio.bfmtv.com/rmcradio_128.mp3", type: "news", lang: "fr", weight: 2 },
+  { name: "RFI Monde", url: "https://rfimonde64k.ice.infomaniak.ch/rfimonde-64.mp3", type: "news", lang: "fr", weight: 2 },
+  { name: "BBC World Service", url: "https://stream.live.vc.bbcmedia.co.uk/bbc_world_service", type: "news", lang: "en", weight: 2 },
+  { name: "NPR News", url: "https://npr-ice.streamguys1.com/live.mp3", type: "news", lang: "en", weight: 2 },
+  { name: "WNYC FM", url: "https://stream.wnyc.org/wnycfm", type: "talk", lang: "en", weight: 2 }
+];
+
 export default function Page() {
   const audioElRef = useRef(null);
 
-  // Audio graph
+  // Audio graph refs
   const ctxRef = useRef(null);
   const masterRef = useRef(null);
   const destRef = useRef(null);
@@ -50,6 +65,9 @@ export default function Page() {
   const driveRef = useRef(null);
   const convolverRef = useRef(null);
   const radioGainRef = useRef(null);
+
+  // Sum node (pour brancher radio + bruit)
+  const sumRef = useRef(null);
 
   // Noise chain
   const noiseNodeRef = useRef(null);
@@ -70,19 +88,19 @@ export default function Page() {
   // Watchdog anti-boucle
   const progressRef = useRef({ lastCT: 0, lastWall: 0, timer: null });
 
-  // Analyser (Garde-voix)
+  // Analyse (Garde-voix)
   const analyserRef = useRef(null);
   const envValRef = useRef(0);
   const envRAFRef = useRef(null);
   const holdUntilRef = useRef(0);
 
-  // Listes stations
-  const [stations, setStations] = useState(FALLBACK_STATIONS);  // liste “affichable” dédupliquée
-  const scanRef = useRef(FALLBACK_STATIONS);                    // liste pondérée pour le balayage
+  // Stations
+  const [stations, setStations] = useState(FALLBACK_STATIONS); // pour affichage
+  const scanRef = useRef(FALLBACK_STATIONS);                   // pour balayage (pondéré)
   const [idx, setIdx] = useState(0);
   const idxRef = useRef(0);
 
-  // UI state
+  // UI
   const [etat, setEtat] = useState("prêt");
   const [marche, setMarche] = useState(false);
   const [auto, setAuto] = useState(false);
@@ -91,15 +109,15 @@ export default function Page() {
   const playingLockRef = useRef(false);
 
   // Contrôles
-  const [vitesse, setVitesse] = useState(0.45); // vitesse de balayage (250..2500 ms)
+  const [vitesse, setVitesse] = useState(0.45); // 250..2500 ms
   const [volume, setVolume]   = useState(0.9);
   const [echo, setEcho]       = useState(0.25);
-  const [bruit, setBruit]     = useState(0.4); // intensité du bruit pendant le saut
+  const [bruit, setBruit]     = useState(0.35); // un peu plus doux par défaut
 
-  // Garde-voix (ex-squelch)
+  // Garde-voix
   const [gardeVoix, setGardeVoix] = useState(true);
-  const [sensi, setSensi]         = useState(0.6);  // sensibilité voix
-  const [maintien, setMaintien]   = useState(0.55); // durée de maintien
+  const [sensi, setSensi]         = useState(0.6);
+  const [maintien, setMaintien]   = useState(0.55);
 
   // Enregistrement
   const [enr, setEnr] = useState(false);
@@ -117,7 +135,7 @@ export default function Page() {
   const supportsType = (m) => window.MediaRecorder?.isTypeSupported?.(m) || false;
   const nowMs = () => performance.now();
 
-  /* ===== Charger stations (fusion json + filtrage codecs + biais parlé) ===== */
+  /* ===== Charger stations + filtrage codecs + pondération ===== */
   useEffect(() => {
     (async () => {
       const all = [];
@@ -132,39 +150,53 @@ export default function Page() {
       let flat = all.length ? all : FALLBACK_STATIONS;
 
       // 1) dédoublonner par URL
-      const seen = new Set();
-      flat = flat.filter((s) => (s && s.url && !seen.has(s.url) ? (seen.add(s.url), true) : false));
+      const dedup = (arr) => {
+        const seen = new Set();
+        return arr.filter((s) => (s && s.url && !seen.has(s.url) ? (seen.add(s.url), true) : false));
+      };
+      flat = dedup(flat);
 
-      // 2) filtrer par codecs supportés
+      // 2) filtrer par codecs jouables
       let playable = flat.filter((s) => {
         const c = guessCodec(s.url);
         if (c === "mp3") return SUPPORT_MP3;
         if (c === "aac") return SUPPORT_AAC;
-        return true;
+        return true; // inconnu -> on tente
       });
+
+      // 3) si très peu jouables, injecter le lot PARLÉ MP3 puis redédoublonner
       if (playable.length < 6) {
-        playable = flat
-          .filter((s) => guessCodec(s.url) !== "aac" || SUPPORT_AAC)
-          .sort((a, b) => (guessCodec(b.url) === "mp3") - (guessCodec(a.url) === "mp3"));
+        playable = dedup([...playable, ...CURATED_TALK_MP3]);
       }
 
-      // 3) pondérer pour favoriser le PARLÉ (type "news"/"talk") + champ "weight"
+      // 4) pondération (favorise PARLÉ)
       const TALK_TYPES = new Set(["talk", "news"]);
       const weighted = [];
       for (const s of playable) {
-        const base = TALK_TYPES.has((s.type || "").toLowerCase()) ? 2 : 1; // bonus si talk/news
+        const base = TALK_TYPES.has((s.type || "").toLowerCase()) ? 2 : 1;
         const w = Math.max(1, Math.min(6, Math.round(s.weight || base)));
         for (let i = 0; i < w; i++) weighted.push(s);
       }
-      // 4) mélanger la liste pondérée
       for (let i = weighted.length - 1; i > 0; i--) {
         const j = Math.floor(Math.random() * (i + 1));
         [weighted[i], weighted[j]] = [weighted[j], weighted[i]];
       }
 
-      setStations(playable);              // affichage (dédupliqué)
-      scanRef.current = weighted.length ? weighted : playable; // balayage (pondéré)
+      // 5) si malgré tout on n’a rien, repli strict sur CURATED_TALK_MP3
+      if (!weighted.length) {
+        playable = CURATED_TALK_MP3.slice();
+        for (let i = playable.length - 1; i > 0; i--) {
+          const j = Math.floor(Math.random() * (i + 1));
+          [playable[i], playable[j]] = [playable[j], playable[i]];
+        }
+        playable.forEach((s) => (s.type = s.type || "news"));
+        weighted.push(...playable);
+      }
+
+      setStations(playable);
+      scanRef.current = weighted;
       idxRef.current = 0; setIdx(0);
+      setEtat("prêt");
     })();
   }, []);
 
@@ -215,7 +247,7 @@ export default function Page() {
     return `${url}${sep}ghostbox_live=${Date.now()}`;
   }
 
-  /* ===== Init Audio graph ===== */
+  /* ===== Init Audio graph (FIX: brancher gRadio -> sum) ===== */
   async function initAudio() {
     if (ctxRef.current) return;
     const ctx = new (window.AudioContext || window.webkitAudioContext)();
@@ -225,11 +257,11 @@ export default function Page() {
     const master = ctx.createGain(); master.gain.value = clamp01(volume); master.connect(ctx.destination);
     masterRef.current = master;
 
-    // Destination pour enregistrement (master complet)
+    // Destination REC
     const dest = ctx.createMediaStreamDestination(); destRef.current = dest;
     master.connect(dest);
 
-    // Radio path
+    // Radio chain
     const hp = ctx.createBiquadFilter();  hp.type = "highpass"; hp.frequency.value = 320; hp.Q.value = 0.7;
     const lp = ctx.createBiquadFilter();  lp.type = "lowpass";  lp.frequency.value = 3400; lp.Q.value = 0.7;
     const shelf = ctx.createBiquadFilter(); shelf.type = "highshelf"; shelf.frequency.value = 2500; shelf.gain.value = -4;
@@ -248,21 +280,24 @@ export default function Page() {
     noiseHPRef.current = hpN; noiseFilterRef.current = bp; noiseLPRef.current = lpN;
     const gNoise = ctx.createGain(); gNoise.gain.value = 0; noiseGainRef.current = gNoise;
 
-    // Écho
+    // Echo
     const dry = ctx.createGain(); dry.gain.value = 1; dryRef.current = dry;
     const dly = ctx.createDelay(1.2); dly.delayTime.value = 0.34;
     const fb  = ctx.createGain(); fb.gain.value = 0.25;
     dly.connect(fb); fb.connect(dly);
     const wet = ctx.createGain(); wet.gain.value = 0; echoDelayRef.current = dly; echoFbRef.current = fb; echoWetRef.current = wet;
 
-    // Clic
+    // Click
     const clickBus = ctx.createGain(); clickBus.gain.value = 0; clickBus.connect(master); clickBusRef.current = clickBus;
 
     // Somme → master
-    const sum = ctx.createGain(); sum.gain.value = 1;
-    // bruit
+    const sum = ctx.createGain(); sum.gain.value = 1; sumRef.current = sum;
+    // BRUIT vers somme
     noise.connect(hpN); hpN.connect(bp); bp.connect(lpN); lpN.connect(gNoise); gNoise.connect(sum);
-    // radio (chaîne complète jusqu'au gRadio ; la source arrive dans attachMedia)
+    // *** FIX CRITIQUE *** : RADIO vers somme
+    gRadio.connect(sum);
+
+    // Sorties
     sum.connect(dry);  dry.connect(master);
     sum.connect(dly);  dly.connect(wet); wet.connect(master);
 
@@ -332,7 +367,7 @@ export default function Page() {
     const el = audioElRef.current;
 
     const chainConnect = (srcNode) => {
-      // src → HP → LP → shelf → drive → convolver → gRadio
+      // src → HP → LP → shelf → drive → convolver → gRadio (→ sum déjà câblé)
       srcNode.connect(radioHPRef.current);
       radioHPRef.current.connect(radioLPRef.current);
       radioLPRef.current.connect(radioShelfRef.current);
@@ -340,7 +375,7 @@ export default function Page() {
       driveRef.current.connect(convolverRef.current);
       convolverRef.current.connect(radioGainRef.current);
 
-      // tap analyser
+      // tap analyse
       try { radioGainRef.current.connect(analyserRef.current); } catch {}
     };
 
@@ -363,25 +398,21 @@ export default function Page() {
       }
     } catch {}
 
-    setCompat(true); // pas d’accès flux → pas d’analyse garde-voix
+    setCompat(true); // pas d’accès flux → on entendra quand même via <audio>, mais pas d’analyse
   }
 
-  /* ===== Boucle “Garde-voix” (enveloppe RMS) ===== */
+  /* ===== Garde-voix (RMS) ===== */
   function startEnvLoop() {
     stopEnvLoop();
     const ana = analyserRef.current; if (!ana) return;
     const buf = new Float32Array(ana.fftSize);
     const tick = () => {
       ana.getFloatTimeDomainData(buf);
-      // RMS
       let sum = 0; for (let i = 0; i < buf.length; i++) { const v = buf[i]; sum += v * v; }
       const rms = Math.sqrt(sum / buf.length);
-      // lissage
       envValRef.current = envValRef.current * 0.9 + rms * 0.1;
 
-      // seuil selon sensi (≈0.015..0.08)
       const thr = 0.015 + (1 - clamp01(sensi)) * 0.065;
-      // durée de maintien 0.4s .. 3.5s
       const holdMs = 400 + clamp01(maintien) * 3100;
 
       if (gardeVoix && !compat && envValRef.current > thr) {
@@ -477,7 +508,7 @@ export default function Page() {
   /* ===== Lecture d'une station ===== */
   async function playIndex(startIndex, tries = 0) {
     const list = scanRef.current;
-    if (!list.length) return;
+    if (!list.length) { setEtat("aucune station jouable"); return; }
     if (tries >= list.length) { setEtat("aucun flux lisible"); return; }
     if (playingLockRef.current) return;
     playingLockRef.current = true;
@@ -598,7 +629,6 @@ export default function Page() {
     stopSweep();
     const tick = async () => {
       if (!marche) return;
-      // Si parole détectée récemment et qu'on est encore dans la fenêtre de maintien → patienter
       if (gardeVoix && !compat && nowMs() < holdUntilRef.current) {
         sweepTimerRef.current = setTimeout(tick, 180);
         return;
@@ -628,7 +658,6 @@ export default function Page() {
       };
       rec.start(); recRef.current = rec; setEnr(true); return;
     }
-    // WAV fallback
     const ctx = ctxRef.current;
     const proc = ctx.createScriptProcessor(4096, 2, 2);
     const tap = ctx.createGain(); tap.gain.value = 1;
@@ -689,13 +718,11 @@ export default function Page() {
     if (masterRef.current) masterRef.current.gain.value = clamp01(volume);
     if (audioElRef.current && compat) audioElRef.current.volume = clamp01(volume);
   }, [volume, compat]);
-
   useEffect(() => {
     if (!echoWetRef.current || !echoFbRef.current) return;
     echoWetRef.current.gain.value = echo * 0.9;
     echoFbRef.current.gain.value = Math.min(0.6, echo * 0.6);
   }, [echo]);
-
   useEffect(() => {
     if (!auto) { stopSweep(); return; }
     if (marche) startSweep();
@@ -763,7 +790,7 @@ export default function Page() {
       </div>
 
       <p style={{ color: "rgba(255,255,255,0.8)", marginTop: 10, fontSize: 12 }}>
-        Le **Garde-voix** suspend le balayage pendant la parole (réglable via Sensibilité & Maintien). La pondération favorise les stations parlées.
+        Le Garde-voix suspend le balayage pendant la parole (réglable via Sensibilité & Maintien). La pondération favorise les stations parlées.
       </p>
     </main>
   );
