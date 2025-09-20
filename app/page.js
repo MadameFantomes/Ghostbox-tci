@@ -1,12 +1,11 @@
 "use client";
 
 /**
- * Ghostbox TCI — FR (vintage UI + knobs fluides)
- * - Radio only • Enregistrement MP3 si supporté (fallback WebM)
- * - Balayage auto, ralenti (lecture + intervalle), bruit discret + ducking
- * - Auto-filtre “TCI” si WebAudio autorisé
+ * Ghostbox TCI — FR (vintage + sliders + MP3 garanti)
+ * - Radio only • Enregistrement MP3 (MediaRecorder si possible, sinon lamejs)
+ * - Balayage corrigé (hard reset + cache-bust + wait canplay + mute echo pendant scan)
+ * - UI vintage (curseurs fluides) • RALENTI (lecture + intervalle)
  * - Charge /public/stations.json sinon fallback FR
- * - LOG minimal (localStorage + BroadcastChannel)
  */
 
 import React, { useEffect, useRef, useState } from "react";
@@ -35,11 +34,7 @@ const FALLBACK_STATIONS = [
 ].map((url) => ({ name: safeHost(url), url }));
 
 function safeHost(url) {
-  try {
-    return new URL(url).host;
-  } catch {
-    return "station";
-  }
+  try { return new URL(url).host; } catch { return "station"; }
 }
 
 export default function Page() {
@@ -59,7 +54,7 @@ export default function Page() {
   const noiseLPRef = useRef(null);
   const noiseGainRef = useRef(null);
 
-  // Radio FX (auto-filtre “TCI”)
+  // Radio FX
   const radioHPRef = useRef(null);
   const radioLPRef = useRef(null);
   const radioShelfRef = useRef(null);
@@ -73,6 +68,9 @@ export default function Page() {
 
   // “clic”
   const clickBusRef = useRef(null);
+
+  // Somme (pour “taper” l’audio lors de l’enregistrement MP3 lamejs)
+  const sumRef = useRef(null);
 
   // Stations / index
   const [stations, setStations] = useState(FALLBACK_STATIONS);
@@ -89,61 +87,78 @@ export default function Page() {
   const sweepTimerRef = useRef(null);
   const playingLockRef = useRef(false);
 
-  // Contrôles
-  const [vitesse, setVitesse] = useState(0.45); // 250..2500 ms
+  // Contrôles (sliders 0..1)
+  const [vitesse, setVitesse] = useState(0.45);
   const [volume, setVolume] = useState(0.9);
-  const [echo, setEcho] = useState(0.25); // un poil plus discret
-  const [debit] = useState(0.35); // fixé (pas de knob)
+  const [echo, setEcho] = useState(0.25);
+  const [debit] = useState(0.35); // fixé (coloration du burst)
 
   // Enregistrement
   const [enr, setEnr] = useState(false);
   const recRef = useRef(null);
   const chunksRef = useRef([]);
 
-  // ------- LOG minimal -------
+  // Enregistrement MP3 via lamejs (si MediaRecorder MP3 indispo)
+  const tapProcRef = useRef(null);
+  const mp3ChunksRef = useRef([]);
+  const mp3EncoderRef = useRef(null);
+
+  // LOG minimal
   const logRef = useRef([]);
   const bcRef = useRef(null);
 
   // Helpers
   const clamp01 = (x) => Math.max(0, Math.min(1, x));
-  const msFromSpeed = (v) => Math.round(250 + v * (2500 - 250)); // 250..2500
+  const msFromSpeed = (v) => Math.round(250 + v * (2500 - 250));
   const BASE_NOISE = 0.006;
   const burstMs = () => Math.round(120 + debit * 520);
   const burstGain = () => Math.min(0.4, 0.08 + debit * 0.32);
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   const sweepDelayMs = () => Math.round(msFromSpeed(vitesse) * (lent ? 2.5 : 1));
 
-  // ------- LOG setup -------
+  // --- anti-boucle / anti-cache ---
+  const cacheBust = (u) => {
+    try { const url = new URL(u); url.searchParams.set("gbx", Date.now().toString(36)); return url.toString(); }
+    catch { return u + (u.includes("?") ? "&" : "?") + "gbx=" + Date.now().toString(36); }
+  };
+  async function hardStop(el) {
+    if (!el) return;
+    try { el.pause(); } catch {}
+    try { el.removeAttribute("src"); } catch {}
+    try { el.src = ""; } catch {}
+    try { el.load(); } catch {}
+    await sleep(40);
+  }
+  function waitFor(el, events = ["playing", "canplay"], timeout = 2500) {
+    return new Promise((resolve, reject) => {
+      let done = false;
+      const on = () => { if (done) return; done = true; cleanup(); resolve(); };
+      const cleanup = () => events.forEach(ev => el.removeEventListener(ev, on));
+      events.forEach(ev => el.addEventListener(ev, on, { once: true }));
+      setTimeout(() => { if (done) return; done = true; cleanup(); reject(new Error("timeout")); }, timeout);
+    });
+  }
+
+  // ------- LOG -------
   useEffect(() => {
     try { bcRef.current = new BroadcastChannel("labo-ghostbox"); } catch {}
     return () => { try { bcRef.current?.close(); } catch {} };
   }, []);
-
   function addLog(event, extra = {}) {
-    const entry = {
-      timestamp: new Date().toISOString(),
-      event, vitesse, lent, volume, echo, station: stationsRef.current[idxRef.current]?.name || null,
-      ...extra,
-    };
+    const entry = { timestamp: new Date().toISOString(), event, vitesse, lent, volume, echo, station: stationsRef.current[idxRef.current]?.name || null, ...extra };
     logRef.current.push(entry);
     try {
-      const key = "ghostbox.logs";
-      const prev = JSON.parse(localStorage.getItem(key) || "[]");
-      prev.push(entry);
-      localStorage.setItem(key, JSON.stringify(prev));
+      const key = "ghostbox.logs"; const prev = JSON.parse(localStorage.getItem(key) || "[]");
+      prev.push(entry); localStorage.setItem(key, JSON.stringify(prev));
     } catch {}
     try { bcRef.current?.postMessage(entry); } catch {}
   }
-
   function exportLog() {
     try {
       const blob = new Blob([JSON.stringify(logRef.current, null, 2)], { type: "application/json" });
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement("a");
-      a.href = url;
-      a.download = `ghostbox-log-${new Date().toISOString().replace(/[:.]/g, "-")}.json`;
-      document.body.appendChild(a); a.click(); document.body.removeChild(a);
-      URL.revokeObjectURL(url);
+      const url = URL.createObjectURL(blob); const a = document.createElement("a");
+      a.href = url; a.download = `ghostbox-log-${new Date().toISOString().replace(/[:.]/g, "-")}.json`;
+      document.body.appendChild(a); a.click(); document.body.removeChild(a); URL.revokeObjectURL(url);
     } catch {}
   }
 
@@ -154,51 +169,27 @@ export default function Page() {
         const r = await fetch("/stations.json", { cache: "no-store" });
         if (!r.ok) throw new Error();
         const flat = normalizeStationsJson(await r.json());
-        if (flat.length) {
-          setStations(flat);
-          stationsRef.current = flat;
-          idxRef.current = 0;
-          setIdx(0);
-        }
-      } catch {
-        stationsRef.current = FALLBACK_STATIONS;
-      }
+        if (flat.length) { setStations(flat); stationsRef.current = flat; idxRef.current = 0; setIdx(0); }
+      } catch { stationsRef.current = FALLBACK_STATIONS; }
     })();
   }, []);
-
   function normalizeStationsJson(json) {
     let list = [];
     const push = (name, url, suffix = "") => {
       if (!url || typeof url !== "string") return;
       if (!/^https:/i.test(url)) return;
-      try {
-        url = url.trim();
-        list.push({ name: (name && name.trim()) || safeHost(url) + suffix, url });
-      } catch {}
+      try { url = url.trim(); list.push({ name: (name && name.trim()) || safeHost(url) + suffix, url }); } catch {}
     };
-
     if (Array.isArray(json)) {
-      json.forEach((s) => { if (!s) return;
-        if (s.url) push(s.name, s.url);
-        if (Array.isArray(s.urls)) s.urls.forEach((u, k) => push(s.name, u, ` #${k + 1}`));
-      });
+      json.forEach((s) => { if (!s) return; if (s.url) push(s.name, s.url); if (Array.isArray(s.urls)) s.urls.forEach((u, k) => push(s.name, u, ` #${k + 1}`)); });
     } else if (json && typeof json === "object") {
-      Object.entries(json).forEach(([group, arr]) => {
-        if (!Array.isArray(arr)) return;
-        arr.forEach((s) => {
-          if (!s) return;
-          if (s.url) push(s.name || group, s.url);
-          if (Array.isArray(s.urls)) s.urls.forEach((u, k) => push(s.name || group, u, ` #${k + 1}`));
-        });
-      });
+      Object.entries(json).forEach(([group, arr]) => Array.isArray(arr) && arr.forEach((s) => {
+        if (!s) return; if (s.url) push(s.name || group, s.url); if (Array.isArray(s.urls)) s.urls.forEach((u, k) => push(s.name || group, u, ` #${k + 1}`));
+      }));
     }
-
     const seen = new Set();
     list = list.filter((s) => (seen.has(s.url) ? false : seen.add(s.url)));
-    for (let i = list.length - 1; i > 0; i--) {
-      const j = Math.floor(Math.random() * (i + 1));
-      [list[i], list[j]] = [list[j], list[i]];
-    }
+    for (let i = list.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [list[i], list[j]] = [list[j], list[i]]; }
     return list;
   }
 
@@ -209,55 +200,33 @@ export default function Page() {
     ctxRef.current = ctx;
 
     // Master
-    const master = ctx.createGain();
-    master.gain.value = clamp01(volume);
-    master.connect(ctx.destination);
-    masterRef.current = master;
+    const master = ctx.createGain(); master.gain.value = clamp01(volume);
+    master.connect(ctx.destination); masterRef.current = master;
 
-    // Enregistrement
+    // Enregistrement (MediaRecorder natif)
     const dest = ctx.createMediaStreamDestination();
-    master.connect(dest);
-    destRef.current = dest;
+    master.connect(dest); destRef.current = dest;
 
     // Radio
-    const gRadio = ctx.createGain();
-    gRadio.gain.value = 1;
-    radioGainRef.current = gRadio;
+    const gRadio = ctx.createGain(); gRadio.gain.value = 1; radioGainRef.current = gRadio;
 
     // Bruit
-    const noise = createNoiseNode(ctx);
-    noiseNodeRef.current = noise;
-
-    const hpN = ctx.createBiquadFilter();
-    hpN.type = "highpass"; hpN.frequency.value = 160; hpN.Q.value = 0.7;
-
-    const bp = ctx.createBiquadFilter();
-    bp.type = "bandpass"; bp.Q.value = 0.55; bp.frequency.value = 1800;
-
-    const lpN = ctx.createBiquadFilter();
-    lpN.type = "lowpass"; lpN.frequency.value = 5200; lpN.Q.value = 0.3;
-
+    const noise = createNoiseNode(ctx); noiseNodeRef.current = noise;
+    const hpN = ctx.createBiquadFilter(); hpN.type = "highpass"; hpN.frequency.value = 160; hpN.Q.value = 0.7;
+    const bp = ctx.createBiquadFilter(); bp.type = "bandpass"; bp.Q.value = 0.55; bp.frequency.value = 1800;
+    const lpN = ctx.createBiquadFilter(); lpN.type = "lowpass"; lpN.frequency.value = 5200; lpN.Q.value = 0.3;
     noiseHPRef.current = hpN; noiseFilterRef.current = bp; noiseLPRef.current = lpN;
-
     const gNoise = ctx.createGain(); gNoise.gain.value = 0; noiseGainRef.current = gNoise;
 
     // Radio auto-filtre
-    const hp = ctx.createBiquadFilter();
-    hp.type = "highpass"; hp.frequency.value = 320; hp.Q.value = 0.7;
-
-    const lp = ctx.createBiquadFilter();
-    lp.type = "lowpass"; lp.frequency.value = 3400; lp.Q.value = 0.7;
-
-    const shelf = ctx.createBiquadFilter();
-    shelf.type = "highshelf"; shelf.frequency.value = 2500; shelf.gain.value = -4;
-
+    const hp = ctx.createBiquadFilter(); hp.type = "highpass"; hp.frequency.value = 320; hp.Q.value = 0.7;
+    const lp = ctx.createBiquadFilter(); lp.type = "lowpass"; lp.frequency.value = 3400; lp.Q.value = 0.7;
+    const shelf = ctx.createBiquadFilter(); shelf.type = "highshelf"; shelf.frequency.value = 2500; shelf.gain.value = -4;
     const drive = createDriveNode(ctx, 0.22);
-
     radioHPRef.current = hp; radioLPRef.current = lp; radioShelfRef.current = shelf; driveRef.current = drive;
 
     // Dry & ÉCHO
     const dry = ctx.createGain(); dry.gain.value = 1; dryRef.current = dry;
-
     const dly = ctx.createDelay(1.2); dly.delayTime.value = 0.34;
     const fb = ctx.createGain(); fb.gain.value = 0.22; dly.connect(fb); fb.connect(dly);
     const wet = ctx.createGain(); wet.gain.value = 0; echoDelayRef.current = dly; echoFbRef.current = fb; echoWetRef.current = wet;
@@ -265,12 +234,15 @@ export default function Page() {
     // “clic”
     const clickBus = ctx.createGain(); clickBus.gain.value = 0; clickBus.connect(master); clickBusRef.current = clickBus;
 
-    // Somme → master
-    const sum = ctx.createGain(); sum.gain.value = 1;
+    // Somme → master (référence pour tap MP3)
+    const sum = ctx.createGain(); sum.gain.value = 1; sumRef.current = sum;
 
+    // bruit : noise → HP → BP → LP → gNoise → sum
     noise.connect(hpN); hpN.connect(bp); bp.connect(lpN); lpN.connect(gNoise); gNoise.connect(sum);
+    // radio : (branchée après attachMedia) → gRadio → sum
     gRadio.connect(sum);
 
+    // sum → dry/master + echo
     sum.connect(dry); dry.connect(master);
     sum.connect(dly); dly.connect(wet); wet.connect(master);
 
@@ -282,30 +254,20 @@ export default function Page() {
     const buf = ctx.createBuffer(1, size, ctx.sampleRate);
     const data = buf.getChannelData(0);
     for (let i = 0; i < size; i++) data[i] = (Math.random() * 2 - 1) * 0.9;
-    const src = ctx.createBufferSource();
-    src.buffer = buf; src.loop = true;
-    return src;
+    const src = ctx.createBufferSource(); src.buffer = buf; src.loop = true; return src;
   }
-
   function createDriveNode(ctx, amount = 0.25) {
-    const ws = ctx.createWaveShaper();
-    ws.curve = makeDistortionCurve(amount); ws.oversample = "4x";
-    return ws;
+    const ws = ctx.createWaveShaper(); ws.curve = makeDistortionCurve(amount); ws.oversample = "4x"; return ws;
   }
   function makeDistortionCurve(amount = 0.25) {
     const k = amount * 100, n = 44100, curve = new Float32Array(n);
     for (let i = 0; i < n; i++) { const x = (i * 2) / n - 1; curve[i] = ((1 + k) * x) / (1 + k * Math.abs(x)); }
     return curve;
   }
-
   function applyAutoFilterProfile() {
-    const ctx = ctxRef.current;
-    if (!AUTO_FILTER || !ctx || !radioHPRef.current) return;
+    const ctx = ctxRef.current; if (!AUTO_FILTER || !ctx || !radioHPRef.current) return;
     const now = ctx.currentTime;
-    const hpF = 260 + Math.random() * 160;
-    const lpF = 2800 + Math.random() * 1400;
-    const shelfGain = -(2 + Math.random() * 5);
-    const driveAmt = 0.16 + Math.random() * 0.12;
+    const hpF = 260 + Math.random() * 160, lpF = 2800 + Math.random() * 1400, shelfGain = -(2 + Math.random() * 5), driveAmt = 0.16 + Math.random() * 0.12;
     try {
       radioHPRef.current.frequency.setTargetAtTime(hpF, now, 0.08);
       radioLPRef.current.frequency.setTargetAtTime(lpF, now, 0.08);
@@ -320,60 +282,43 @@ export default function Page() {
     try {
       const src = ctxRef.current.createMediaElementSource(audioElRef.current);
       mediaSrcRef.current = src;
-
       if (AUTO_FILTER && radioHPRef.current) {
         src.connect(radioHPRef.current);
         radioHPRef.current.connect(radioLPRef.current);
         radioLPRef.current.connect(radioShelfRef.current);
         radioShelfRef.current.connect(driveRef.current);
         driveRef.current.connect(radioGainRef.current);
-      } else {
-        src.connect(radioGainRef.current);
-      }
+      } else { src.connect(radioGainRef.current); }
 
       const el = audioElRef.current;
       const duckToFloor = () => {
         const now = ctxRef.current.currentTime;
-        try {
-          noiseGainRef.current.gain.cancelScheduledValues(now);
-          noiseGainRef.current.gain.setTargetAtTime(BASE_NOISE, now, 0.12);
-        } catch {}
+        try { noiseGainRef.current.gain.cancelScheduledValues(now); noiseGainRef.current.gain.setTargetAtTime(BASE_NOISE, now, 0.12); } catch {}
       };
       el.addEventListener("playing", duckToFloor);
       el.addEventListener("timeupdate", duckToFloor);
-      attachMedia._cleanup = () => {
-        el.removeEventListener("playing", duckToFloor);
-        el.removeEventListener("timeupdate", duckToFloor);
-      };
+      attachMedia._cleanup = () => { el.removeEventListener("playing", duckToFloor); el.removeEventListener("timeupdate", duckToFloor); };
 
       setCompat(false);
-    } catch {
-      setCompat(true);
-    }
+    } catch { setCompat(true); }
   }
 
   // ------- Power -------
   async function powerOn() {
     await initAudio();
-    const ctx = ctxRef.current;
-    if (ctx.state === "suspended") await ctx.resume();
+    const ctx = ctxRef.current; if (ctx.state === "suspended") await ctx.resume();
     try { noiseGainRef.current.gain.value = BASE_NOISE; } catch {}
-    addLog("power_on");
-    await playIndex(idxRef.current);
-    setMarche(true);
+    addLog("power_on"); await playIndex(idxRef.current); setMarche(true);
   }
-
   async function powerOff() {
     stopSweep();
     const el = audioElRef.current;
     try { noiseGainRef.current.gain.value = 0; } catch {}
-    if (el) { el.pause(); el.src = ""; el.load(); }
+    if (el) { await hardStop(el); }
     if (attachMedia._cleanup) attachMedia._cleanup();
-
     if (enr) { try { recRef.current?.stop(); } catch {} setEnr(false); }
     try { await ctxRef.current?.suspend(); } catch {}
-    setMarche(false); setAuto(false); setEtat("arrêté"); playingLockRef.current = false;
-    addLog("power_off");
+    setMarche(false); setAuto(false); setEtat("arrêté"); playingLockRef.current = false; addLog("power_off");
   }
 
   function triggerClick(level = 0.28) {
@@ -393,17 +338,13 @@ export default function Page() {
     const now = ctx.currentTime;
     const bp = noiseFilterRef.current, hp = noiseHPRef.current, lp = noiseLPRef.current;
     const g = noiseGainRef.current?.gain;
-    const q = 0.35 + debit * 0.45;
-    const lpF = 4200 + debit * 1600;
-    const hpF = 160 + debit * 180;
+    const q = 0.35 + debit * 0.45, lpF = 4200 + debit * 1600, hpF = 160 + debit * 180;
     try { bp.Q.setTargetAtTime(q, now, 0.05); lp.frequency.setTargetAtTime(lpF, now, 0.08); hp.frequency.setTargetAtTime(hpF, now, 0.08); } catch {}
 
-    const fStart = 800 + Math.random() * 800;
-    const fMid = 1300 + Math.random() * 1500;
-    const fEnd = 1800 + Math.random() * 1800;
+    const fStart = 800 + Math.random() * 800, fMid = 1300 + Math.random() * 1500, fEnd = 1800 + Math.random() * 1800;
     const steps = Math.max(4, Math.floor(durSec * 10));
     for (let i = 0; i <= steps; i++) {
-      const t = now + (durSec * i) / steps; const x = i / steps;
+      const t = now + (durSec * i) / steps, x = i / steps;
       const f = x < 0.6 ? fStart + ((fMid - fStart) * x) / 0.6 : fMid + ((fEnd - fMid) * (x - 0.6)) / 0.4;
       const jitter = (Math.random() * 2 - 1) * (80 + 380 * (1 - debit));
       try { bp.frequency.linearRampToValueAtTime(Math.max(300, f + jitter), t); } catch {}
@@ -434,50 +375,55 @@ export default function Page() {
     const ctx = ctxRef.current; const now = ctx.currentTime;
     const dur = burstMs() / 1000; const targetNoise = burstGain();
 
+    // 1) clic + montée du bruit + baisse radio + MUTE ECHO
     triggerClick();
+    const prevWet = echoWetRef.current?.gain?.value ?? 0;
+    try { echoWetRef.current.gain.cancelScheduledValues(now); echoWetRef.current.gain.setValueAtTime(0, now); } catch {}
     try {
-      if (!compat) {
-        radioGainRef.current.gain.cancelScheduledValues(now);
-        radioGainRef.current.gain.linearRampToValueAtTime(0.0001, now + 0.05);
-      } else { el.volume = 0; }
+      if (!compat) { radioGainRef.current.gain.cancelScheduledValues(now); radioGainRef.current.gain.linearRampToValueAtTime(0.0001, now + 0.05); }
+      else { el.volume = 0; }
     } catch {}
 
     playScanBurst(targetNoise, dur);
     setEtat("balayage…"); addLog("scan_burst", { targetNoise, dur });
-    await sleep(Math.max(100, dur * 600));
+    await sleep(Math.max(80, dur * 500));
 
+    // 2) HARD STOP + cache-busting + lecture
     try {
-      el.crossOrigin = "anonymous"; el.pause(); el.src = url; el.load();
-
+      await hardStop(el);
+      el.crossOrigin = "anonymous";
+      el.preload = "none";
+      el.src = cacheBust(url);
       try {
         el.playbackRate = lent ? 0.88 : 1;
         if ("preservesPitch" in el) el.preservesPitch = false;
         if ("mozPreservesPitch" in el) el.mozPreservesPitch = false;
         if ("webkitPreservesPitch" in el) el.webkitPreservesPitch = false;
       } catch {}
-
-      const playP = el.play();
-      const timeout = new Promise((_, rej) => setTimeout(() => rej(new Error("timeout")), 3500));
-      await Promise.race([playP, timeout]);
+      const playP = el.play().catch(() => {});
+      await Promise.race([waitFor(el, ["playing", "canplay"], 2200), playP]);
 
       await attachMedia(); applyAutoFilterProfile();
 
-      const after = ctx.currentTime + Math.max(0.08, dur * 0.6);
+      // 3) retour
+      const after = ctx.currentTime + Math.max(0.06, dur * 0.45);
       try {
-        noiseGainRef.current.gain.setTargetAtTime(BASE_NOISE, after, 0.12);
-        if (!compat) radioGainRef.current.gain.setTargetAtTime(1, after, 0.08);
+        noiseGainRef.current.gain.setTargetAtTime(BASE_NOISE, after, 0.1);
+        if (!compat) radioGainRef.current.gain.setTargetAtTime(1, after, 0.07);
         else el.volume = clamp01(volume);
+        echoWetRef.current.gain.setTargetAtTime(prevWet, after + 0.05, 0.12);
       } catch {}
 
       idxRef.current = startIndex; setIdx(startIndex);
       setEtat(compat ? "lecture (compatibilité)" : "lecture");
       addLog("play_station", { url, compat });
     } catch {
-      try { noiseGainRef.current.gain.setTargetAtTime(BASE_NOISE, ctx.currentTime + 0.05, 0.12); } catch {}
-      const next = (startIndex + 1) % list.length;
-      playingLockRef.current = false; await playIndex(next, tries + 1); return;
+      try {
+        noiseGainRef.current.gain.setTargetAtTime(BASE_NOISE, ctx.currentTime + 0.05, 0.12);
+        echoWetRef.current.gain.setTargetAtTime(prevWet, ctx.currentTime + 0.05, 0.1);
+      } catch {}
+      const next = (startIndex + 1) % list.length; playingLockRef.current = false; await playIndex(next, tries + 1); return;
     }
-
     playingLockRef.current = false;
   }
 
@@ -495,54 +441,132 @@ export default function Page() {
   }
   function stopSweep() { if (sweepTimerRef.current) clearTimeout(sweepTimerRef.current); sweepTimerRef.current = null; }
 
-  // ------- Enregistrement (MP3 si possible) -------
-  function toggleEnr() {
+  // ------- Enregistrement (MP3 prioritaire) -------
+  async function toggleEnr() {
+    if (!ctxRef.current) await initAudio();
     if (!destRef.current) return;
-    if (!enr) {
-      let options = { mimeType: "audio/mpeg" };
-      if (!("MediaRecorder" in window) || !MediaRecorder.isTypeSupported?.(options.mimeType)) {
-        options = { mimeType: "audio/webm;codecs=opus" };
-      }
-      let rec;
-      try { rec = new MediaRecorder(destRef.current.stream, options); }
-      catch { rec = new MediaRecorder(destRef.current.stream); }
 
-      chunksRef.current = [];
-      rec.ondataavailable = (e) => { if (e.data && e.data.size) chunksRef.current.push(e.data); };
-      rec.onstop = () => {
-        const mime = rec.mimeType || "audio/webm";
-        const ext = /mpeg/i.test(mime) ? "mp3" : "webm";
-        const blob = new Blob(chunksRef.current, { type: mime });
-        const url = URL.createObjectURL(blob);
-        const a = document.createElement("a");
-        a.href = url; a.download = `ghostbox-${new Date().toISOString().replace(/[:.]/g, "-")}.${ext}`;
-        document.body.appendChild(a); a.click(); setTimeout(() => { document.body.removeChild(a); URL.revokeObjectURL(url); }, 0);
-      };
-      rec.start(); recRef.current = rec; setEnr(true);
+    if (!enr) {
+      // 1) tenter MP3 natif via MediaRecorder
+      let useNative = false;
+      if ("MediaRecorder" in window && MediaRecorder.isTypeSupported?.("audio/mpeg")) useNative = true;
+
+      if (useNative) {
+        // MediaRecorder MP3
+        let rec;
+        try { rec = new MediaRecorder(destRef.current.stream, { mimeType: "audio/mpeg" }); }
+        catch { rec = new MediaRecorder(destRef.current.stream); } // sécurité
+        chunksRef.current = [];
+        rec.ondataavailable = (e) => { if (e.data && e.data.size) chunksRef.current.push(e.data); };
+        rec.onstop = () => {
+          const mime = rec.mimeType || "audio/mpeg";
+          const blob = new Blob(chunksRef.current, { type: mime });
+          const url = URL.createObjectURL(blob);
+          const a = document.createElement("a");
+          a.href = url; a.download = `ghostbox-${ts()}.mp3`;
+          document.body.appendChild(a); a.click(); document.body.removeChild(a);
+          URL.revokeObjectURL(url);
+        };
+        rec.start(); recRef.current = rec; setEnr(true);
+        addLog("rec_start_native");
+      } else {
+        // 2) fallback MP3 via lamejs (tap sur la somme audio)
+        try {
+          const lame = await import("lamejs");
+          const Mp3Encoder = lame.Mp3Encoder || lame.default?.Mp3Encoder;
+          if (!Mp3Encoder) throw new Error("lamejs not ready");
+
+          const ctx = ctxRef.current;
+          const channels = 2;
+          const kbps = 128;
+          mp3EncoderRef.current = new Mp3Encoder(channels, ctx.sampleRate, kbps);
+          mp3ChunksRef.current = [];
+
+          const proc = ctx.createScriptProcessor(4096, channels, channels);
+          tapProcRef.current = proc;
+
+          // On lit le mix "sum"
+          sumRef.current.connect(proc);
+          // Certains browsers n’appellent pas le processor sans sortie :
+          const zero = ctx.createGain(); zero.gain.value = 0; proc.connect(zero); zero.connect(ctx.destination);
+
+          proc.onaudioprocess = (ev) => {
+            const inL = ev.inputBuffer.getChannelData(0);
+            const inR = ev.inputBuffer.numberOfChannels > 1 ? ev.inputBuffer.getChannelData(1) : inL;
+            // Convert Float32 -> Int16
+            const l16 = f32ToI16(inL);
+            const r16 = f32ToI16(inR);
+            const data = mp3EncoderRef.current.encodeBuffer(l16, r16);
+            if (data && data.length) mp3ChunksRef.current.push(new Int8Array(data));
+          };
+
+          setEnr(true);
+          addLog("rec_start_lamejs");
+        } catch (e) {
+          // dernier recours : webm (pour ne pas bloquer)
+          let rec;
+          try { rec = new MediaRecorder(destRef.current.stream, { mimeType: "audio/webm;codecs=opus" }); }
+          catch { rec = new MediaRecorder(destRef.current.stream); }
+          chunksRef.current = [];
+          rec.ondataavailable = (ev) => { if (ev.data && ev.data.size) chunksRef.current.push(ev.data); };
+          rec.onstop = () => {
+            const blob = new Blob(chunksRef.current, { type: "audio/webm" });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement("a"); a.href = url; a.download = `ghostbox-${ts()}.webm`;
+            document.body.appendChild(a); a.click(); document.body.removeChild(a); URL.revokeObjectURL(url);
+          };
+          rec.start(); recRef.current = rec; setEnr(true);
+          addLog("rec_start_webm_fallback");
+        }
+      }
     } else {
-      try { recRef.current?.stop(); } catch {}
+      // STOP
+      if (tapProcRef.current && mp3EncoderRef.current) {
+        // lamejs path
+        try {
+          tapProcRef.current.disconnect(); tapProcRef.current.onaudioprocess = null; tapProcRef.current = null;
+          const rest = mp3EncoderRef.current.flush();
+          if (rest && rest.length) mp3ChunksRef.current.push(new Int8Array(rest));
+          const blob = new Blob(mp3ChunksRef.current, { type: "audio/mpeg" });
+          const url = URL.createObjectURL(blob);
+          const a = document.createElement("a"); a.href = url; a.download = `ghostbox-${ts()}.mp3`;
+          document.body.appendChild(a); a.click(); document.body.removeChild(a); URL.revokeObjectURL(url);
+        } catch {}
+        mp3EncoderRef.current = null; mp3ChunksRef.current = [];
+      } else {
+        try { recRef.current?.stop(); } catch {}
+      }
       setEnr(false);
+      addLog("rec_stop");
     }
   }
+
+  // utilitaires enregistrement
+  function f32ToI16(f32) {
+    const out = new Int16Array(f32.length);
+    for (let i = 0; i < f32.length; i++) {
+      const s = Math.max(-1, Math.min(1, f32[i]));
+      out[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
+    }
+    return out;
+  }
+  function ts() { return new Date().toISOString().replace(/[:.]/g, "-"); }
 
   /* ------- Réactions contrôles ------- */
   useEffect(() => {
     if (masterRef.current) masterRef.current.gain.value = clamp01(volume);
     if (audioElRef.current && compat) audioElRef.current.volume = clamp01(volume);
   }, [volume, compat]);
-
   useEffect(() => {
     if (!echoWetRef.current || !echoFbRef.current) return;
     echoWetRef.current.gain.value = echo * 0.9;
     echoFbRef.current.gain.value = Math.min(0.6, echo * 0.6);
   }, [echo]);
-
   useEffect(() => {
     if (!auto) { stopSweep(); return; }
     if (marche) startSweep();
     return stopSweep;
   }, [auto, vitesse, marche, lent]);
-
   useEffect(() => {
     const el = audioElRef.current; if (!el) return;
     try {
@@ -583,9 +607,7 @@ export default function Page() {
           <div style={styles.dialWrap}>
             <div style={styles.dialGlass}>
               <div style={styles.scale}>
-                {Array.from({ length: 11 }).map((_, i) => (
-                  <div key={i} style={styles.tick} />
-                ))}
+                {Array.from({ length: 11 }).map((_, i) => (<div key={i} style={styles.tick} />))}
               </div>
               <div style={styles.needle} />
             </div>
@@ -607,15 +629,15 @@ export default function Page() {
               <Switch label="BALAYAGE AUTO" on={auto} onChange={(v) => { setAuto(v); addLog(v ? "auto_on" : "auto_off"); }} />
               <Switch label="RALENTI" on={lent} onChange={(v) => { setLent(v); addLog(v ? "slow_on" : "slow_off"); }} />
               <div style={{ display: "flex", gap: 10 }}>
-                <Bouton label={enr ? "STOP ENREG." : "ENREGISTRER"} onClick={() => { toggleEnr(); addLog(enr ? "rec_stop" : "rec_start"); }} color={enr ? "#f0c14b" : "#c76d4b"} />
+                <Bouton label={enr ? "STOP ENREG." : "ENREGISTRER"} onClick={toggleEnr} color={enr ? "#f0c14b" : "#c76d4b"} />
                 <Bouton label="Exporter log" onClick={exportLog} color="#e7dcc6" />
               </div>
             </div>
 
-            <div style={styles.knobs}>
-              <Knob label="VITESSE" value={vitesse} onChange={(v) => setVitesse(clamp01(v))} hint={`${sweepDelayMs()} ms`} />
-              <Knob label="VOLUME" value={volume} onChange={(v) => setVolume(clamp01(v))} />
-              <Knob label="ÉCHO" value={echo} onChange={(v) => setEcho(clamp01(v))} />
+            <div style={styles.sliders}>
+              <Slider label="VITESSE" value={vitesse} onChange={(v) => setVitesse(clamp01(v))} hint={`${sweepDelayMs()} ms`} />
+              <Slider label="VOLUME"  value={volume}  onChange={(v) => setVolume(clamp01(v))} />
+              <Slider label="ÉCHO"    value={echo}    onChange={(v) => setEcho(clamp01(v))} />
             </div>
           </div>
 
@@ -629,104 +651,37 @@ export default function Page() {
       </div>
 
       <p style={{ color: "rgba(60,40,20,0.85)", marginTop: 10, fontSize: 12 }}>
-        Astuce : <strong>VITESSE</strong> lente + <strong>ÉCHO</strong> léger pour un rendu plus “boîte à esprits”.
+        Enreg. MP3 activé (lamejs si besoin). Sliders = plus précis & fluides.
       </p>
     </main>
   );
 }
 
-/* ------- Knob fluide (rotation circulaire + inertie) ------- */
-function Knob({ label, value, onChange, hint }) {
-  const rootRef = useRef(null);
-  const [dragging, setDragging] = useState(false);
-  const angleRef = useRef(-135 + value * 270);    // angle courant affiché
-  const targetRef = useRef(-135 + value * 270);   // angle cible selon souris
-  const rafRef = useRef(0);
+/* ------- Slider custom (ultra fluide) ------- */
+function Slider({ label, value, onChange, hint }) {
+  const barRef = useRef(null);
+  const [drag, setDrag] = useState(false);
 
-  // synchro externe
-  useEffect(() => {
-    const target = -135 + value * 270;
-    targetRef.current = target;
-    // on rapproche doucement l’angle courant
-    animate();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [value]);
-
-  function angleToValue(a) {
-    const clamped = Math.max(-135, Math.min(135, a));
-    return (clamped + 135) / 270;
-  }
-
-  function getAngleFromPointer(e) {
-    const el = rootRef.current;
-    const rect = el.getBoundingClientRect();
-    const cx = rect.left + rect.width / 2;
-    const cy = rect.top + rect.height / 2;
-    const dx = e.clientX - cx;
-    const dy = e.clientY - cy;
-    let deg = (Math.atan2(dy, dx) * 180) / Math.PI; // -180..180
-    deg -= 90; // pointer vers le haut = -90 -> remet à 0
-    if (deg < -180) deg += 360;
-    // contraint sur l’arc [-135..135]
-    return Math.max(-135, Math.min(135, deg));
-  }
-
-  function animate() {
-    cancelAnimationFrame(rafRef.current);
-    const step = () => {
-      const a = angleRef.current;
-      const t = targetRef.current;
-      // inertie douce (lerp)
-      const next = a + (t - a) * 0.22;
-      angleRef.current = next;
-      // met à jour l’affichage via style
-      if (rootRef.current) {
-        rootRef.current.style.transform = `rotate(${next}deg)`;
-      }
-      // informe le parent (throttlé via la même boucle)
-      onChange(angleToValue(next));
-      if (Math.abs(next - t) > 0.1) rafRef.current = requestAnimationFrame(step);
-    };
-    rafRef.current = requestAnimationFrame(step);
-  }
-
-  function onPointerDown(e) {
-    e.preventDefault();
-    setDragging(true);
-    e.currentTarget.setPointerCapture(e.pointerId);
-    targetRef.current = getAngleFromPointer(e);
-    animate();
-  }
-  function onPointerMove(e) {
-    if (!dragging) return;
-    targetRef.current = getAngleFromPointer(e);
-    // l’animation suit toute seule
-  }
-  function onPointerUp(e) {
-    setDragging(false);
-    try { e.currentTarget.releasePointerCapture(e.pointerId); } catch {}
-  }
-
-  const angleStart = -135 + value * 270; // position initiale
+  const setFromClientX = (clientX) => {
+    const rect = barRef.current.getBoundingClientRect();
+    const x = (clientX - rect.left) / rect.width;
+    onChange(Math.max(0, Math.min(1, x)));
+  };
 
   return (
-    <div style={ui.knobBlock}>
-      <div style={ui.knobShadow}>
-        <div
-          ref={rootRef}
-          style={{ ...ui.knob, transform: `rotate(${angleStart}deg)` }}
-          onPointerDown={onPointerDown}
-          onPointerMove={onPointerMove}
-          onPointerUp={onPointerUp}
-          onPointerCancel={onPointerUp}
-          aria-label={label}
-        >
-          <div style={ui.knobCap}>
-            <div style={ui.knobIndicator} />
-          </div>
-        </div>
+    <div style={ui.sliderBlock}>
+      <div style={ui.sliderLabel}>{label}</div>
+      <div
+        ref={barRef}
+        style={ui.sliderRail}
+        onPointerDown={(e) => { e.currentTarget.setPointerCapture(e.pointerId); setDrag(true); setFromClientX(e.clientX); }}
+        onPointerMove={(e) => { if (drag) setFromClientX(e.clientX); }}
+        onPointerUp={() => setDrag(false)}
+        onPointerCancel={() => setDrag(false)}
+      >
+        <div style={{ ...ui.sliderFill, width: `${value * 100}%` }} />
+        <div style={{ ...ui.sliderThumb, left: `${value * 100}%` }} />
       </div>
-      <div style={ui.knobLabel}>{label}</div>
       {hint && <div style={ui.hint}>{hint}</div>}
     </div>
   );
@@ -743,30 +698,17 @@ function Switch({ label, on, onChange }) {
     </div>
   );
 }
-
 function Bouton({ label, onClick, color = "#b77d56" }) {
-  return (
-    <button onClick={onClick} style={{ ...ui.button, background: color }}>
-      {label}
-    </button>
-  );
+  return <button onClick={onClick} style={{ ...ui.button, background: color }}>{label}</button>;
 }
-
 function Lamp({ label, on, colorOn = "#86fb6a" }) {
   return (
     <div style={ui.lamp}>
-      <div
-        style={{
-          ...ui.lampDot,
-          background: on ? colorOn : "#5a4a3f",
-          boxShadow: on ? "0 0 14px rgba(134,251,106,0.55)" : "inset 0 0 4px rgba(0,0,0,0.5)",
-        }}
-      />
+      <div style={{ ...ui.lampDot, background: on ? colorOn : "#5a4a3f", boxShadow: on ? "0 0 14px rgba(134,251,106,0.55)" : "inset 0 0 4px rgba(0,0,0,0.5)" }} />
       <div style={ui.lampLabel}>{label}</div>
     </div>
   );
 }
-
 function Vis({ at }) {
   const pos = { tl: { top: -8, left: -8 }, tr: { top: -8, right: -8 }, bl: { bottom: -8, left: -8 }, br: { bottom: -8, right: -8 } }[at] || {};
   return <div style={{ ...decor.screw, ...pos }} />;
@@ -774,199 +716,66 @@ function Vis({ at }) {
 
 /* ------- Styles vintage ------- */
 const styles = {
-  page: {
-    minHeight: "100vh",
-    background: "linear-gradient(180deg,#f1d6ad 0%,#e6c79c 55%,#dfbd90 100%)",
-    display: "grid",
-    placeItems: "center",
-    padding: 24,
-  },
+  page: { minHeight: "100vh", background: "linear-gradient(180deg,#f1d6ad 0%,#e6c79c 55%,#dfbd90 100%)", display: "grid", placeItems: "center", padding: 24 },
   shadowWrap: { position: "relative" },
   cabinet: {
-    width: "min(980px, 94vw)",
-    borderRadius: 28,
-    padding: 18,
+    width: "min(980px, 94vw)", borderRadius: 28, padding: 18,
     border: "1px solid rgba(90,60,30,0.5)",
-    background:
-      "linear-gradient(180deg,#d1a46d,#b58854 80%,#9f7747), url('/skin-watercolor.svg')",
-    backgroundBlendMode: "multiply",
-    backgroundSize: "cover",
-    boxShadow:
-      "0 40px 90px rgba(70,45,20,0.45), inset 0 1px 0 rgba(255,255,255,0.25), inset 0 -3px 0 rgba(0,0,0,0.25)",
-    position: "relative",
-    overflow: "hidden",
+    background: "linear-gradient(180deg,#d1a46d,#b58854 80%,#9f7747), url('/skin-watercolor.svg')",
+    backgroundBlendMode: "multiply", backgroundSize: "cover",
+    boxShadow: "0 40px 90px rgba(70,45,20,0.45), inset 0 1px 0 rgba(255,255,255,0.25), inset 0 -3px 0 rgba(0,0,0,0.25)",
+    position: "relative", overflow: "hidden",
   },
-  textureOverlay: {
-    position: "absolute",
-    inset: 0,
-    pointerEvents: "none",
-    background:
-      "radial-gradient(1200px 600px at 20% 10%, rgba(255,255,255,0.18), transparent 60%)," +
-      "radial-gradient(900px 500px at 80% 80%, rgba(0,0,0,0.18), transparent 55%)",
-    mixBlendMode: "overlay",
-  },
-
-  headerBar: {
-    display: "flex",
-    alignItems: "center",
-    justifyContent: "space-between",
-    marginBottom: 12,
-  },
-  brandPlate: {
-    background: "linear-gradient(180deg,#6a4a2e,#4f3520)",
-    color: "#fbedd7",
-    borderRadius: 12,
-    border: "1px solid rgba(255,255,255,0.08)",
-    padding: "10px 14px",
-    letterSpacing: 1.2,
-    boxShadow: "inset 0 0 18px rgba(0,0,0,0.5), 0 4px 12px rgba(0,0,0,0.25)",
-  },
+  textureOverlay: { position: "absolute", inset: 0, pointerEvents: "none", background: "radial-gradient(1200px 600px at 20% 10%, rgba(255,255,255,0.18), transparent 60%),radial-gradient(900px 500px at 80% 80%, rgba(0,0,0,0.18), transparent 55%)", mixBlendMode: "overlay" },
+  headerBar: { display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 12 },
+  brandPlate: { background: "linear-gradient(180deg,#6a4a2e,#4f3520)", color: "#fbedd7", borderRadius: 12, border: "1px solid rgba(255,255,255,0.08)", padding: "10px 14px", letterSpacing: 1.2, boxShadow: "inset 0 0 18px rgba(0,0,0,0.5), 0 4px 12px rgba(0,0,0,0.25)" },
   brandText: { fontFamily: "Georgia,serif", fontWeight: 800, fontSize: 15 },
   brandSub: { fontFamily: "Georgia,serif", fontSize: 12, opacity: 0.85 },
   rightHeader: { display: "flex", alignItems: "center", gap: 12 },
   lampsRow: { display: "flex", gap: 14, alignItems: "center" },
 
-  dialWrap: {
-    borderRadius: 16,
-    border: "1px solid rgba(60,40,20,0.5)",
-    background: "linear-gradient(180deg,#f8e8c6,#e8d1a8)",
-    padding: 10,
-    marginBottom: 10,
-    boxShadow: "inset 0 0 28px rgba(0,0,0,0.28)",
-  },
-  dialGlass: {
-    position: "relative",
-    height: 64,
-    borderRadius: 12,
-    background: "linear-gradient(180deg,#fff9ea,#f6e1b9)",
-    boxShadow: "inset 0 1px 0 rgba(255,255,255,0.9), inset 0 -2px 10px rgba(0,0,0,0.15)",
-    overflow: "hidden",
-  },
-  scale: {
-    position: "absolute",
-    inset: 0,
-    display: "grid",
-    gridTemplateColumns: "repeat(11,1fr)",
-    alignItems: "center",
-    padding: "0 16px",
-  },
+  dialWrap: { borderRadius: 16, border: "1px solid rgba(60,40,20,0.5)", background: "linear-gradient(180deg,#f8e8c6,#e8d1a8)", padding: 10, marginBottom: 10, boxShadow: "inset 0 0 28px rgba(0,0,0,0.28)" },
+  dialGlass: { position: "relative", height: 64, borderRadius: 12, background: "linear-gradient(180deg,#fff9ea,#f6e1b9)", boxShadow: "inset 0 1px 0 rgba(255,255,255,0.9), inset 0 -2px 10px rgba(0,0,0,0.15)", overflow: "hidden" },
+  scale: { position: "absolute", inset: 0, display: "grid", gridTemplateColumns: "repeat(11,1fr)", alignItems: "center", padding: "0 16px" },
   tick: { width: 2, height: 16, background: "#6c543d", justifySelf: "center" },
-  needle: {
-    position: "absolute",
-    left: "50%",
-    top: 6,
-    width: 2,
-    height: "calc(100% - 12px)",
-    background: "#2e2015",
-    boxShadow: "0 0 0 1px rgba(255,255,255,0.2)",
-    transform: "translateX(-50%)",
-    borderRadius: 2,
-  },
+  needle: { position: "absolute", left: "50%", top: 6, width: 2, height: "calc(100% - 12px)", background: "#2e2015", boxShadow: "0 0 0 1px rgba(255,255,255,0.2)", transform: "translateX(-50%)", borderRadius: 2 },
 
-  glass: {
-    borderRadius: 14,
-    border: "1px solid rgba(76,56,36,0.6)",
-    background: "linear-gradient(180deg, rgba(255,236,200,0.7), rgba(230,200,160,0.8))",
-    padding: 10,
-    position: "relative",
-    overflow: "hidden",
-    boxShadow: "inset 0 0 26px rgba(0,0,0,0.35)",
-  },
+  glass: { borderRadius: 14, border: "1px solid rgba(76,56,36,0.6)", background: "linear-gradient(180deg, rgba(255,236,200,0.7), rgba(230,200,160,0.8))", padding: 10, position: "relative", overflow: "hidden", boxShadow: "inset 0 0 26px rgba(0,0,0,0.35)" },
   stationRow: { display: "flex", justifyContent: "space-between", color: "#3a2a1a", fontSize: 13, padding: "2px 2px" },
-  compatBanner: {
-    position: "absolute",
-    right: 10,
-    bottom: 10,
-    background: "rgba(240,180,60,0.18)",
-    border: "1px solid rgba(240,180,60,0.35)",
-    color: "#7a5418",
-    padding: "6px 10px",
-    borderRadius: 8,
-    fontSize: 12,
-  },
+  compatBanner: { position: "absolute", right: 10, bottom: 10, background: "rgba(240,180,60,0.18)", border: "1px solid rgba(240,180,60,0.35)", color: "#7a5418", padding: "6px 10px", borderRadius: 8, fontSize: 12 },
 
-  controlsRow: {
-    marginTop: 14,
-    display: "grid",
-    gridTemplateColumns: "1fr 2fr",
-    gap: 14,
-    alignItems: "center",
-  },
+  controlsRow: { marginTop: 14, display: "grid", gridTemplateColumns: "1fr 2fr", gap: 14, alignItems: "center" },
   switches: { display: "grid", gap: 10, alignContent: "start" },
+  sliders: { display: "grid", gridTemplateColumns: "repeat(3, minmax(220px, 1fr))", gap: 16, alignItems: "center", justifyItems: "center" },
 
-  knobs: {
-    display: "grid",
-    gridTemplateColumns: "repeat(3, minmax(120px, 1fr))",
-    gap: 16,
-    alignItems: "center",
-    justifyItems: "center",
-  },
-
-  speakerGrille: {
-    marginTop: 14,
-    height: 140,
-    borderRadius: 18,
-    border: "1px solid rgba(60,40,20,0.5)",
-    background:
-      "radial-gradient(circle at 8px 8px, rgba(40,22,12,0.9) 1.5px, transparent 2px) 0 0 / 16px 16px," +
-      "linear-gradient(180deg,#a87a48,#8f6437)",
-    boxShadow: "inset 0 12px 28px rgba(0,0,0,0.45), inset 0 -6px 18px rgba(0,0,0,0.35)",
-  },
+  speakerGrille: { marginTop: 14, height: 140, borderRadius: 18, border: "1px solid rgba(60,40,20,0.5)", background: "radial-gradient(circle at 8px 8px, rgba(40,22,12,0.9) 1.5px, transparent 2px) 0 0 / 16px 16px,linear-gradient(180deg,#a87a48,#8f6437)", boxShadow: "inset 0 12px 28px rgba(0,0,0,0.45), inset 0 -6px 18px rgba(0,0,0,0.35)" },
 };
 
 const ui = {
-  knobBlock: { display: "grid", justifyItems: "center" },
-  knobShadow: {
-    width: 110, height: 110, borderRadius: "50%",
-    boxShadow: "inset 0 10px 18px rgba(255,255,255,0.2), inset 0 -10px 18px rgba(0,0,0,0.25), 0 10px 24px rgba(0,0,0,0.35)",
-    background: "radial-gradient(circle at 30% 30%, #d8b281, #a4794b 60%, #7b5836)",
-    border: "1px solid rgba(70,45,25,0.6)",
-    display: "grid", placeItems: "center",
-  },
-  knob: {
-    width: 92, height: 92, borderRadius: "50%",
-    transition: "transform 0.05s linear", // pour la synchro initiale ; le mouvement est lissé via RAF
-  },
-  knobCap: {
-    width: "100%", height: "100%", borderRadius: "50%",
-    background: "radial-gradient(circle at 32% 30%, #f7deb8, #c79a64 58%, #8e663c 100%)",
-    border: "1px solid rgba(50,30,15,0.5)",
-    display: "grid", placeItems: "center",
-  },
-  knobIndicator: {
-    width: 8, height: 34, borderRadius: 4,
-    background: "#2f1f12",
-    boxShadow: "0 0 0 1px rgba(255,255,255,0.3)",
-  },
-  knobLabel: { color: "#3a2a1a", marginTop: 6, fontSize: 12, letterSpacing: 1.2, fontFamily: "Georgia,serif" },
   hint: { color: "rgba(60,40,20,0.7)", fontSize: 11, marginTop: 2 },
 
-  switchBlock: { display: "grid", gridTemplateColumns: "auto 1fr", alignItems: "center", gap: 10, cursor: "pointer" },
-  switchLabel: { color: "#3a2a1a", fontSize: 12, letterSpacing: 1.2, fontFamily: "Georgia,serif" },
-  switch: {
-    width: 58, height: 26, borderRadius: 16, position: "relative",
-    border: "1px solid rgba(70,50,30,0.6)",
-    background: "linear-gradient(180deg,#d7c2a4,#b79a77)",
+  sliderBlock: { display: "grid", gap: 6, justifyItems: "stretch" },
+  sliderLabel: { color: "#3a2a1a", fontSize: 12, letterSpacing: 1.2, fontFamily: "Georgia,serif", textAlign: "center" },
+  sliderRail: {
+    position: "relative", width: "100%", height: 30, borderRadius: 16,
+    border: "1px solid rgba(70,50,30,0.6)", background: "linear-gradient(180deg,#d7c2a4,#b79a77)",
     boxShadow: "inset 0 2px 0 rgba(255,255,255,0.6), inset 0 -3px 0 rgba(0,0,0,0.15)",
+    touchAction: "none", userSelect: "none", cursor: "pointer",
   },
-  switchDot: {
-    width: 24, height: 24, borderRadius: "50%", background: "#6e553d",
+  sliderFill: { position: "absolute", left: 0, top: 0, bottom: 0, borderRadius: 16, background: "linear-gradient(180deg,#b98556,#9a6b42)" },
+  sliderThumb: {
+    position: "absolute", top: "50%", transform: "translate(-50%,-50%)",
+    width: 22, height: 22, borderRadius: "50%", background: "#6e553d",
     border: "1px solid rgba(40,25,10,0.5)",
-    position: "absolute", top: 1, left: 1, transition: "transform .18s cubic-bezier(.2,.8,.2,1)",
     boxShadow: "0 3px 6px rgba(0,0,0,0.3), inset 0 1px 0 rgba(255,255,255,0.4)",
   },
 
-  button: {
-    cursor: "pointer",
-    border: "1px solid rgba(70,45,25,0.6)",
-    borderRadius: 12,
-    padding: "10px 14px",
-    fontWeight: 800,
-    fontSize: 13,
-    color: "#2a1c10",
-    boxShadow: "0 6px 16px rgba(0,0,0,0.3), inset 0 1px 0 rgba(255,255,255,0.4)",
-    background: "#b77d56",
-  },
+  switchBlock: { display: "grid", gridTemplateColumns: "auto 1fr", alignItems: "center", gap: 10, cursor: "pointer" },
+  switchLabel: { color: "#3a2a1a", fontSize: 12, letterSpacing: 1.2, fontFamily: "Georgia,serif" },
+  switch: { width: 58, height: 26, borderRadius: 16, position: "relative", border: "1px solid rgba(70,50,30,0.6)", background: "linear-gradient(180deg,#d7c2a4,#b79a77)", boxShadow: "inset 0 2px 0 rgba(255,255,255,0.6), inset 0 -3px 0 rgba(0,0,0,0.15)" },
+  switchDot: { width: 24, height: 24, borderRadius: "50%", background: "#6e553d", border: "1px solid rgba(40,25,10,0.5)", position: "absolute", top: 1, left: 1, transition: "transform .18s cubic-bezier(.2,.8,.2,1)", boxShadow: "0 3px 6px rgba(0,0,0,0.3), inset 0 1px 0 rgba(255,255,255,0.4)" },
+
+  button: { cursor: "pointer", border: "1px solid rgba(70,45,25,0.6)", borderRadius: 12, padding: "10px 14px", fontWeight: 800, fontSize: 13, color: "#2a1c10", boxShadow: "0 6px 16px rgba(0,0,0,0.3), inset 0 1px 0 rgba(255,255,255,0.4)", background: "#b77d56" },
 
   lamp: { display: "grid", gridTemplateColumns: "auto auto", gap: 6, alignItems: "center" },
   lampDot: { width: 12, height: 12, borderRadius: "50%" },
@@ -974,11 +783,5 @@ const ui = {
 };
 
 const decor = {
-  screw: {
-    position: "absolute",
-    width: 18, height: 18, borderRadius: "50%",
-    background: "radial-gradient(circle at 30% 30%, #b6b0a7, #6c655c 60%, #3b362f)",
-    border: "1px solid #2a2621",
-    boxShadow: "0 8px 20px rgba(0,0,0,0.5), inset 0 3px 8px rgba(0,0,0,0.6)",
-  },
+  screw: { position: "absolute", width: 18, height: 18, borderRadius: "50%", background: "radial-gradient(circle at 30% 30%, #b6b0a7, #6c655c 60%, #3b362f)", border: "1px solid #2a2621", boxShadow: "0 8px 20px rgba(0,0,0,0.5), inset 0 3px 8px rgba(0,0,0,0.6)" },
 };
