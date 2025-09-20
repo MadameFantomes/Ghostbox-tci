@@ -1,13 +1,12 @@
 "use client";
 
 /**
- * Ghostbox TCI — FR
+ * Ghostbox TCI — FR (sans micro)
  * - Fusionne /public/stations.json + /public/stations-extra.json (dédoublonné)
- * - Balayage "direct" (HLS/playlist écartés) + live-edge forcé
+ * - Balayage "direct" (HLS/playlists écartés) + live-edge forcé
  * - Bruit discret + ducking
- * - MICRO mixé dans le même fichier que la Ghostbox
- * - Potard NIVEAU MIC + interrupteur MONITEUR MIC (écoute dans les HP)
- * - ENREGISTRER : MP3 si supporté, sinon WAV
+ * - ENREGISTRER : MP3 si supporté, sinon WAV (uniquement la Ghostbox)
+ * - Anti-boucle : watchdog qui détecte le buffer qui “répète” et reconnecte
  * - Fallback CORS : captureStream() si MediaElementSource indisponible
  */
 
@@ -31,20 +30,11 @@ export default function Page() {
   // Audio
   const ctxRef = useRef(null);
   const masterRef = useRef(null);        // vers HP
-  const recordMixRef = useRef(null);     // bus REC (master + mic)
   const destRef = useRef(null);          // MediaStreamDestination (REC)
 
-  // Radio source
+  // Radio
   const mediaSrcRef = useRef(null);
   const radioGainRef = useRef(null);
-
-  // Micro
-  const micSrcRef = useRef(null);
-  const micHPRef  = useRef(null);
-  const micCompRef= useRef(null);
-  const micGainRef= useRef(null);        // niveau envoyé dans REC (+ moniteur)
-  const micMonGainRef = useRef(null);    // niveau de monitoring vers HP
-  const micStreamRef = useRef(null);
 
   // Bruit
   const noiseNodeRef = useRef(null);
@@ -68,6 +58,9 @@ export default function Page() {
   // Clic
   const clickBusRef = useRef(null);
 
+  // Watchdog anti-boucle
+  const progressRef = useRef({ lastCT: 0, lastWall: 0, timer: null });
+
   // Stations
   const [stations, setStations] = useState(FALLBACK_STATIONS);
   const stationsRef = useRef(FALLBACK_STATIONS);
@@ -79,20 +72,16 @@ export default function Page() {
   const [marche, setMarche] = useState(false);
   const [auto, setAuto] = useState(false);
   const [compat, setCompat] = useState(false);
-  const [micOn, setMicOn] = useState(false);
-  const [micErr, setMicErr] = useState("");
-  const [monitor, setMonitor] = useState(false);
-  const [micLevel, setMicLevel] = useState(1.0); // potard niveau mic (REC + moniteur)
   const sweepTimerRef = useRef(null);
   const playingLockRef = useRef(false);
 
   // Contrôles
-  const [vitesse, setVitesse] = useState(0.45);
+  const [vitesse, setVitesse] = useState(0.45); // 250..2500 ms
   const [volume, setVolume]  = useState(0.9);
-  const [echo, setEcho]      = useState(0.3);
+  const [echo, setEcho]      = useState(0.25);
   const [debit, setDebit]    = useState(0.4);
 
-  // Enregistrement
+  // Enregistrement (Ghostbox seule)
   const [enr, setEnr] = useState(false);
   const recRef = useRef(null);
   const chunksRef = useRef([]);
@@ -154,7 +143,11 @@ export default function Page() {
         });
       });
     }
-    for (let i = list.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [list[i], list[j]] = [list[j], list[i]]; }
+    // petit mélange
+    for (let i = list.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [list[i], list[j]] = [list[j], list[i]];
+    }
     return list;
   }
 
@@ -182,13 +175,9 @@ export default function Page() {
     const master = ctx.createGain(); master.gain.value = clamp01(volume); master.connect(ctx.destination);
     masterRef.current = master;
 
-    // REC bus (master + mic)
-    const recordMix = ctx.createGain(); recordMix.gain.value = 1; recordMixRef.current = recordMix;
+    // Destination REC (la Ghostbox uniquement)
     const dest = ctx.createMediaStreamDestination(); destRef.current = dest;
-    recordMix.connect(dest);
-
-    // Master va aussi vers REC
-    master.connect(recordMix);
+    master.connect(dest);
 
     // Radio gain (sera câblé par attachMedia)
     const gRadio = ctx.createGain(); gRadio.gain.value = 1; radioGainRef.current = gRadio;
@@ -265,7 +254,7 @@ export default function Page() {
     } catch {}
   }
 
-  /* ===== Attacher la radio (avec fallback captureStream) ===== */
+  /* ===== Attacher la radio (MediaElementSource ou captureStream) ===== */
   async function attachMedia() {
     if (!ctxRef.current || !audioElRef.current) return;
     if (mediaSrcRef.current) return;
@@ -273,6 +262,7 @@ export default function Page() {
     const ctx = ctxRef.current;
     const el = audioElRef.current;
 
+    // 1) Tentative standard
     try {
       const src = ctx.createMediaElementSource(el);
       mediaSrcRef.current = src;
@@ -291,6 +281,7 @@ export default function Page() {
       return;
     } catch {}
 
+    // 2) Fallback : captureStream()
     try {
       const stream = el.captureStream?.();
       if (stream && stream.getAudioTracks().length > 0) {
@@ -312,57 +303,9 @@ export default function Page() {
       }
     } catch {}
 
-    setCompat(true); // pas ancré (lecture sans traitement); le REC prendra quand même master (sans radio)
+    // 3) Non câblé → compat (on entendra mais sans traitement, et l’enregistrement prendra quand même le master)
+    setCompat(true);
   }
-
-  /* ===== Micro (REC + moniteur optionnel) ===== */
-  async function toggleMic(on) {
-    setMicErr("");
-    if (!on) {
-      try { micSrcRef.current?.disconnect(); micGainRef.current?.disconnect(); micMonGainRef.current?.disconnect(); micHPRef.current?.disconnect(); micCompRef.current?.disconnect(); } catch {}
-      try { micStreamRef.current?.getTracks().forEach(t => t.stop()); } catch {}
-      micSrcRef.current = null; micGainRef.current = null; micMonGainRef.current = null; micHPRef.current = null; micCompRef.current = null; micStreamRef.current = null;
-      setMicOn(false);
-      return true;
-    }
-    try {
-      await initAudio();
-      const ctx = ctxRef.current;
-      const stream = await navigator.mediaDevices.getUserMedia({
-        audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: false }
-      });
-      micStreamRef.current = stream;
-
-      // Chaîne mic : Source → HP 120 Hz → Compresseur doux → micGain
-      const src = ctx.createMediaStreamSource(stream);
-      const hp = ctx.createBiquadFilter(); hp.type = "highpass"; hp.frequency.value = 120; hp.Q.value = 0.7;
-      const comp = ctx.createDynamicsCompressor();
-      comp.threshold.value = -24; comp.knee.value = 20; comp.ratio.value = 3; comp.attack.value = 0.01; comp.release.value = 0.25;
-      const g = ctx.createGain(); g.gain.value = micLevel; // potard
-
-      src.connect(hp); hp.connect(comp); comp.connect(g);
-      // Vers REC (toujours)
-      g.connect(recordMixRef.current);
-
-      // Moniteur (vers HP) — connecté/déconnecté selon l'état "monitor"
-      const mon = ctx.createGain(); mon.gain.value = monitor ? 0.18 : 0; // -15 dB env.
-      g.connect(mon); mon.connect(masterRef.current);
-
-      micSrcRef.current = src; micHPRef.current = hp; micCompRef.current = comp;
-      micGainRef.current = g; micMonGainRef.current = mon;
-
-      setMicOn(true);
-      return true;
-    } catch (e) {
-      setMicErr(e?.message || "Accès micro refusé");
-      setMicOn(false);
-      return false;
-    }
-  }
-
-  // React aux potards mic & monitor
-  useEffect(() => { if (micGainRef.current) micGainRef.current.gain.value = clamp01(micLevel) * 2.0; }, [micLevel]);
-  useEffect(() => { if (micMonGainRef.current) micMonGainRef.current.gain.value = monitor ? 0.18 : 0; }, [monitor]);
 
   /* ===== Power / Lecture ===== */
   async function powerOn() {
@@ -376,6 +319,7 @@ export default function Page() {
 
   async function powerOff() {
     stopSweep();
+    stopWatchdog();
     const el = audioElRef.current;
     try { noiseGainRef.current.gain.value = 0; } catch {}
     if (el) { el.pause(); el.src = ""; el.load(); }
@@ -469,7 +413,9 @@ export default function Page() {
     await sleep(Math.max(100, dur * 600));
 
     try {
+      stopWatchdog(); // on repart propre
       el.crossOrigin = "anonymous";
+      el.preload = "none";
       el.pause();
       el.src = withCacheBust(url);
       el.load();
@@ -484,6 +430,9 @@ export default function Page() {
 
       await attachMedia();
       applyAutoFilterProfile();
+
+      // Arm watchdog anti-boucle
+      startWatchdog();
 
       const after = ctx.currentTime + Math.max(0.08, dur * 0.6);
       try {
@@ -505,6 +454,66 @@ export default function Page() {
     playingLockRef.current = false;
   }
 
+  // Watchdog : si currentTime n’avance pas assez ou recule → reconnexion
+  function startWatchdog() {
+    stopWatchdog();
+    const el = audioElRef.current;
+    if (!el) return;
+
+    progressRef.current.lastCT = 0;
+    progressRef.current.lastWall = performance.now();
+
+    const tick = () => {
+      const now = performance.now();
+      const ct = el.currentTime || 0;
+
+      // Pas de progression suffisante pendant 2500 ms ?
+      if (ct <= progressRef.current.lastCT + 0.05) {
+        if (now - progressRef.current.lastWall > 2500) {
+          resyncSameStation();
+          return;
+        }
+      } else {
+        progressRef.current.lastCT = ct;
+        progressRef.current.lastWall = now;
+      }
+
+      // Recul franc (certaines implémentations bouclent leur buffer) ?
+      if (ct + 0.25 < progressRef.current.lastCT) {
+        resyncSameStation();
+        return;
+      }
+
+      progressRef.current.timer = setTimeout(tick, 500);
+    };
+
+    progressRef.current.timer = setTimeout(tick, 800);
+  }
+  function stopWatchdog() {
+    if (progressRef.current.timer) clearTimeout(progressRef.current.timer);
+    progressRef.current.timer = null;
+  }
+  async function resyncSameStation() {
+    stopWatchdog();
+    const el = audioElRef.current;
+    if (!el) return;
+    try {
+      setEtat("resync direct…");
+      const cur = stationsRef.current[idxRef.current];
+      const url = typeof cur === "string" ? cur : cur.url;
+      el.pause();
+      el.src = ""; el.load();
+      await sleep(80);
+      el.src = withCacheBust(url);
+      el.load();
+      await el.play();
+      startWatchdog();
+      setEtat("lecture");
+    } catch {
+      // si ça échoue, on tentera la suivante au prochain balayage
+    }
+  }
+
   function startSweep() {
     stopSweep();
     const tick = async () => {
@@ -521,39 +530,34 @@ export default function Page() {
     sweepTimerRef.current = null;
   }
 
-  /* ===== ENREGISTREMENT (MP3/WAV) ===== */
-  async function startRecording() {
-    await initAudio();
+  /* ===== ENREGISTREMENT (MP3/WAV) — Ghostbox seulement ===== */
+  function startRecording() {
+    if (!destRef.current) return;
 
-    // 1) Armer le micro AVANT de démarrer
-    if (!micOn) {
-      const ok = await toggleMic(true);
-      if (!ok) {
-        setMicErr("Micro indisponible : l’enregistrement ne contiendra que la radio.");
-      }
-    }
-
-    // 2) MP3 si supporté
+    // MP3 si supporté
     if (supportsType("audio/mpeg")) {
       const rec = new MediaRecorder(destRef.current.stream, { mimeType: "audio/mpeg" });
       chunksRef.current = [];
       rec.ondataavailable = (e) => { if (e.data.size) chunksRef.current.push(e.data); };
       rec.onstop = () => {
         const blob = new Blob(chunksRef.current, { type: "audio/mpeg" });
-        downloadBlob(URL.createObjectURL(blob), "ghostbox-mix.mp3");
+        downloadBlob(URL.createObjectURL(blob), "ghostbox.mp3");
       };
       rec.start();
-      recRef.current = rec;
-      setEnr(true);
+      recRef.current = rec; setEnr(true);
       return;
     }
 
-    // 3) WAV (fallback)
+    // Fallback WAV
     const ctx = ctxRef.current;
     const proc = ctx.createScriptProcessor(4096, 2, 2);
     wavRecRef.current = { active: true, proc, buffersL: [], buffersR: [], length: 0 };
-    recordMixRef.current.connect(proc);
-    proc.connect(ctx.destination);
+    // On “tape” le master pour REC
+    const tap = ctx.createGain(); tap.gain.value = 1;
+    masterRef.current.connect(tap);
+    tap.connect(proc); // entrée du proc
+    proc.connect(ctx.destination); // nécessaire pour garder le node actif
+
     proc.onaudioprocess = (e) => {
       if (!wavRecRef.current.active) return;
       const inL = e.inputBuffer.getChannelData(0);
@@ -562,6 +566,9 @@ export default function Page() {
       wavRecRef.current.buffersR.push(new Float32Array(inR));
       wavRecRef.current.length += inL.length;
     };
+
+    // On garde une référence pour débrancher proprement
+    wavRecRef.current.tap = tap;
     setEnr(true);
   }
 
@@ -572,7 +579,7 @@ export default function Page() {
     }
     if (!wavRecRef.current.active) return;
     wavRecRef.current.active = false;
-    try { recordMixRef.current.disconnect(wavRecRef.current.proc); } catch {}
+    try { masterRef.current.disconnect(wavRecRef.current.tap); } catch {}
     try { wavRecRef.current.proc.disconnect(); } catch {}
 
     const { buffersL, buffersR, length } = wavRecRef.current;
@@ -584,7 +591,7 @@ export default function Page() {
     for (let i = 0; i < buffersL.length; i++) { L.set(buffersL[i], off); R.set(buffersR[i], off); off += buffersL[i].length; }
     const wav = encodeWAV(L, R, rate);
     const blob = new Blob([wav], { type: "audio/wav" });
-    downloadBlob(URL.createObjectURL(blob), "ghostbox-mix.wav");
+    downloadBlob(URL.createObjectURL(blob), "ghostbox.wav");
     setEnr(false);
   }
 
@@ -657,6 +664,7 @@ export default function Page() {
         <div style={styles.cabinet}>
           <div style={styles.textureOverlay} />
 
+          {/* En-tête */}
           <div style={styles.headerBar}>
             <div style={styles.brandPlate}>
               <div style={styles.brandText}>MADAME FANTÔMES</div>
@@ -667,26 +675,26 @@ export default function Page() {
                 <Lamp label="MARCHE" on={marche} />
                 <Lamp label="AUTO"   on={auto} colorOn="#86fb6a" />
                 <Lamp label="ENR"    on={enr}  colorOn="#ff5656" />
-                <Lamp label="MIC"    on={micOn} colorOn="#6ac8ff" />
               </div>
             </div>
           </div>
 
+          {/* Cadran */}
           <div style={styles.glass}>
             <div style={styles.stationRow}>
               <div><strong>{currentName || "—"}</strong></div>
               <div><em style={{ opacity: 0.9 }}>{etat}</em></div>
             </div>
-            {compat && <div style={styles.compatBanner}>Compat : captureStream tentée pour inclure la radio au REC.</div>}
-            {micErr && <div style={styles.warnBanner}>Micro : {micErr}</div>}
+            {compat && (
+              <div style={styles.compatBanner}>Compat : la radio peut être limitée (CORS). Le suivi live est surveillé.</div>
+            )}
           </div>
 
+          {/* Contrôles */}
           <div style={styles.controlsRow}>
             <div style={styles.switches}>
               <Switch label="MARCHE" on={marche} onChange={async v => { setMarche(v); v ? await powerOn() : await powerOff(); }} />
               <Switch label="BALAYAGE AUTO" on={auto} onChange={(v) => setAuto(v)} />
-              <Switch label="MICRO ENR" on={micOn} onChange={(v) => toggleMic(v)} />
-              <Switch label="MONITEUR MIC" on={monitor} onChange={(v) => setMonitor(v)} />
               <Bouton label={enr ? (supportsType("audio/mpeg") ? "STOP ENREG. (MP3)" : "STOP ENREG. (WAV)") : "ENREGISTRER"} onClick={toggleEnr} color={enr ? "#f0c14b" : "#d96254"} />
             </div>
 
@@ -695,7 +703,6 @@ export default function Page() {
               <Knob label="VOLUME"  value={volume}  onChange={(v) => setVolume(clamp01(v))} />
               <Knob label="ÉCHO"    value={echo}    onChange={(v) => setEcho(clamp01(v))} />
               <Knob label="DÉBIT"   value={debit}   onChange={(v) => setDebit(clamp01(v))} hint={`${burstMs()} ms de bruit`} />
-              <Knob label="NIVEAU MIC" value={micLevel} onChange={(v) => setMicLevel(clamp01(v))} />
             </div>
           </div>
 
@@ -706,8 +713,7 @@ export default function Page() {
       </div>
 
       <p style={{ color: "rgba(255,255,255,0.8)", marginTop: 10, fontSize: 12 }}>
-        L’enregistrement mélange Ghostbox + Micro dans un seul fichier (MP3 si possible, sinon WAV).
-        Active “MONITEUR MIC” si tu veux t’entendre dans les HP (attention au larsen).
+        Anti-boucle activé : si une station “répète” (buffer figé), la Ghostbox se resynchronise automatiquement au direct.
       </p>
     </main>
   );
@@ -764,51 +770,115 @@ function Vis({ at }) {
 }
 
 const styles = {
-  page: { minHeight: "100vh", background: "linear-gradient(180deg,#1b2432 0%,#0f1723 60%,#0a0f18 100%)", display: "grid", placeItems: "center", padding: 24 },
+  page: {
+    minHeight: "100vh",
+    background: "linear-gradient(180deg,#1b2432 0%,#0f1723 60%,#0a0f18 100%)",
+    display: "grid", placeItems: "center", padding: 24
+  },
   shadowWrap: { position: "relative" },
   cabinet: {
-    width: "min(980px, 94vw)", borderRadius: 26, padding: 16,
+    width: "min(980px, 94vw)",
+    borderRadius: 26,
+    padding: 16,
     border: "1px solid rgba(48,42,36,0.55)",
     boxShadow: "0 30px 88px rgba(0,0,0,0.65), inset 0 0 0 1px rgba(255,255,255,0.04)",
-    backgroundImage: "url('/skin-watercolor.svg')", backgroundSize: "cover", backgroundPosition: "center", backgroundBlendMode: "multiply",
-    position: "relative", overflow: "hidden"
+    backgroundImage: "url('/skin-watercolor.svg')",
+    backgroundSize: "cover",
+    backgroundPosition: "center",
+    backgroundBlendMode: "multiply",
+    position: "relative",
+    overflow: "hidden"
   },
-  textureOverlay: { position: "absolute", inset: 0, pointerEvents: "none",
-    background: "radial-gradient(circle at 30% 20%, rgba(255,255,255,0.06), rgba(255,255,255,0) 60%), radial-gradient(circle at 70% 70%, rgba(0,0,0,0.12), rgba(0,0,0,0) 55%)" },
+  textureOverlay: {
+    position: "absolute",
+    inset: 0,
+    pointerEvents: "none",
+    background:
+      "radial-gradient(circle at 30% 20%, rgba(255,255,255,0.06), rgba(255,255,255,0) 60%)," +
+      "radial-gradient(circle at 70% 70%, rgba(0,0,0,0.12), rgba(0,0,0,0) 55%)"
+  },
   headerBar: { display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 12 },
-  brandPlate: { background: "linear-gradient(180deg,#2a2f36,#1c2129)", color: "#efe6d2", borderRadius: 12, border: "1px solid #2a2e36", padding: "10px 14px", boxShadow: "inset 0 0 20px rgba(0,0,0,0.45)" },
+  brandPlate: {
+    background: "linear-gradient(180deg,#2a2f36,#1c2129)",
+    color: "#efe6d2",
+    borderRadius: 12,
+    border: "1px solid #2a2e36",
+    padding: "10px 14px",
+    boxShadow: "inset 0 0 20px rgba(0,0,0,0.45)"
+  },
   brandText: { fontFamily: "Georgia,serif", fontWeight: 800, letterSpacing: 1.5, fontSize: 14 },
   brandSub: { fontFamily: "Georgia,serif", fontSize: 12, opacity: 0.8 },
+
   rightHeader: { display: "flex", alignItems: "center", gap: 12 },
   lampsRow: { display: "flex", gap: 14, alignItems: "center" },
-  glass: { borderRadius: 16, border: "1px solid rgba(35,45,60,0.9)", background: "linear-gradient(180deg, rgba(168,201,210,0.55), rgba(58,88,110,0.6))", padding: 12, position: "relative", overflow: "hidden", boxShadow: "inset 0 0 32px rgba(0,0,0,0.55)" },
+
+  glass: {
+    borderRadius: 16,
+    border: "1px solid rgba(35,45,60,0.9)",
+    background: "linear-gradient(180deg, rgba(168,201,210,0.55), rgba(58,88,110,0.6))",
+    padding: 12, position: "relative", overflow: "hidden",
+    boxShadow: "inset 0 0 32px rgba(0,0,0,0.55)"
+  },
   stationRow: { display: "flex", justifyContent: "space-between", color: "#f3efe6", fontSize: 13, padding: "2px 2px" },
-  compatBanner: { position: "absolute", right: 10, bottom: 10, background: "rgba(240,180,60,0.18)", border: "1px solid rgba(240,180,60,0.35)", color: "#f0c572", padding: "6px 10px", borderRadius: 8, fontSize: 12 },
-  warnBanner: { position: "absolute", left: 10, bottom: 10, background: "rgba(255,80,80,0.18)", border: "1px solid rgba(255,80,80,0.35)", color: "#ff8c8c", padding: "6px 10px", borderRadius: 8, fontSize: 12 },
+
+  compatBanner: {
+    position: "absolute", right: 10, bottom: 10,
+    background: "rgba(240,180,60,0.18)", border: "1px solid rgba(240,180,60,0.35)",
+    color: "#f0c572", padding: "6px 10px", borderRadius: 8, fontSize: 12
+  },
+
   controlsRow: { marginTop: 16, display: "grid", gridTemplateColumns: "1fr 2fr", gap: 14, alignItems: "center" },
   switches: { display: "grid", gap: 10, alignContent: "start" },
-  knobs: { display: "grid", gridTemplateColumns: "repeat(5, minmax(120px, 1fr))", gap: 14, alignItems: "center", justifyItems: "center" }
+  knobs: {
+    display: "grid",
+    gridTemplateColumns: "repeat(4, minmax(120px, 1fr))",
+    gap: 14,
+    alignItems: "center",
+    justifyItems: "center"
+  }
 };
+
 const ui = {
   knobBlock: { display: "grid", justifyItems: "center" },
   knob: {
     width: 100, height: 100, borderRadius: "50%",
     background: "radial-gradient(circle at 32% 28%, #6d6f79, #3a3f4a 62%, #1b2230 100%)",
-    border: "1px solid rgba(28,30,38,0.9)", boxShadow: "inset 0 12px 30px rgba(0,0,0,0.55), 0 8px 26px rgba(0,0,0,0.45)",
-    display: "grid", placeItems: "center", touchAction: "none", userSelect: "none", cursor: "grab"
+    border: "1px solid rgba(28,30,38,0.9)",
+    boxShadow: "inset 0 12px 30px rgba(0,0,0,0.55), 0 8px 26px rgba(0,0,0,0.45)",
+    display: "grid", placeItems: "center",
+    touchAction: "none", userSelect: "none", cursor: "grab"
   },
   knobIndicator: { width: 8, height: 34, borderRadius: 4, background: "#e1b66f", boxShadow: "0 0 10px rgba(225,182,111,0.45)" },
   knobLabel: { color: "#f0eadc", marginTop: 6, fontSize: 13, letterSpacing: 1.2, textAlign: "center", fontFamily: "Georgia,serif" },
   hint: { color: "rgba(255,255,255,0.7)", fontSize: 11, marginTop: 2 },
+
   switchBlock: { display: "grid", gridTemplateColumns: "auto 1fr", alignItems: "center", gap: 10, cursor: "pointer" },
   switchLabel: { color: "#f0eadc", fontSize: 12, letterSpacing: 1.2, fontFamily: "Georgia,serif" },
   switch: { width: 64, height: 26, borderRadius: 16, position: "relative", border: "1px solid rgba(40,44,56,0.9)", background: "linear-gradient(180deg,#2a2f36,#20252d)" },
   switchDot: { width: 24, height: 24, borderRadius: "50%", background: "#10151c", border: "1px solid #2b2f39", position: "absolute", top: 1, left: 1, transition: "transform .15s" },
-  button: { cursor: "pointer", border: "1px solid rgba(60,48,38,0.8)", borderRadius: 12, padding: "10px 14px", fontWeight: 800, fontSize: 13, color: "#0b0b10", boxShadow: "0 6px 18px rgba(0,0,0,0.35)", background: "#d96254" },
+
+  button: {
+    cursor: "pointer",
+    border: "1px solid rgba(60,48,38,0.8)",
+    borderRadius: 12,
+    padding: "10px 14px",
+    fontWeight: 800,
+    fontSize: 13,
+    color: "#0b0b10",
+    boxShadow: "0 6px 18px rgba(0,0,0,0.35)",
+    background: "#d96254"
+  },
+
   lamp: { display: "grid", gridTemplateColumns: "auto auto", gap: 6, alignItems: "center" },
   lampDot: { width: 12, height: 12, borderRadius: "50%" },
   lampLabel: { color: "#efe6d2", fontSize: 11, letterSpacing: 1, fontFamily: "Georgia,serif" }
 };
+
 const decor = {
-  screw: { position: "absolute", width: 18, height: 18, borderRadius: "50%", background: "radial-gradient(circle at 30% 30%, #9aa0ad, #4b515e 60%, #1e232d)", border: "1px solid #222834", boxShadow: "0 8px 20px rgba(0,0,0,0.5), inset 0 3px 8px rgba(0,0,0,0.6)" }
+  screw: {
+    position: "absolute", width: 18, height: 18, borderRadius: "50%",
+    background: "radial-gradient(circle at 30% 30%, #9aa0ad, #4b515e 60%, #1e232d)",
+    border: "1px solid #222834",
+    boxShadow: "0 8px 20px rgba(0,0,0,0.5), inset 0 3px 8px rgba(0,0,0,0.6)"
+  }
 };
