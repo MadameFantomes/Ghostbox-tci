@@ -1,53 +1,48 @@
 {
-  "France (Radio France)": [
-    { "name": "France Inter", "url": "https://icecast.radiofrance.fr/franceinter-midfi.mp3" },
-    { "name": "France Culture", "url": "https://direct.franceculture.fr/live/franceculture-midfi.mp3" },
-    { "name": "France Musique", "url": "https://direct.francemusique.fr/live/francemusique-midfi.mp3" },
-    { "name": "franceinfo:", "url": "https://direct.franceinfo.fr/live/franceinfo-midfi.mp3" },
-    { "name": "Mouv'", "url": "https://icecast.radiofrance.fr/mouv-midfi.mp3" }
+  "France": [
+    { "name": "France Inter",      "url": "https://icecast.radiofrance.fr/franceinter-midfi.mp3" },
+    { "name": "France Culture",    "url": "https://icecast.radiofrance.fr/franceculture-midfi.mp3" },
+    { "name": "France Musique",    "url": "https://icecast.radiofrance.fr/francemusique-midfi.mp3" },
+    { "name": "franceinfo",        "url": "https://icecast.radiofrance.fr/franceinfo-midfi.mp3" },
+    { "name": "Mouv'",             "url": "https://icecast.radiofrance.fr/mouv-midfi.mp3" },
+    { "name": "Mouv' Rap Français","url": "https://icecast.radiofrance.fr/mouvrapfr-midfi.mp3" },
+
+    { "name": "TSF Jazz",          "url": "https://tsfjazz.ice.infomaniak.ch/tsfjazz-high.mp3" },
+    { "name": "Radio Meuh",        "url": "https://radiomeuh.ice.infomaniak.ch/radiomeuh-128.mp3" },
+    { "name": "Radio Nova",        "url": "https://nova-stream-01.ice.infomaniak.ch/nova-128.mp3" },
+    { "name": "Radio Nova (NovaZZ)","url": "https://novazz.ice.infomaniak.ch/novazz-128.mp3" },
+
+    { "name": "Skyrock",           "url": "https://icecast.skyrock.net/s/natio_mp3_128k" },
+    { "name": "OUI FM",            "url": "https://stream.ouifm.fr/ouifm-high.mp3" },
+    { "name": "NRJ France",        "url": "https://scdn.nrjaudio.fm/adwz1/fr/30001/mp3_128.mp3" },
+    { "name": "Fun Radio",         "url": "https://streaming.radio.funradio.fr/fun-1-44-128" },
+    { "name": "RTL2",              "url": "https://streaming.radio.rtl2.fr/rtl2-1-44-128" },
+    { "name": "RFM",               "url": "https://stream6.radiomonitor.com/RFM_128" },
+
+    { "name": "RTL (info & talk)",     "url": "https://icecast.rtl.fr/rtl-1-44-128" },
+    { "name": "RMC (info/talk/sport)", "url": "https://audio.bfmtv.com/rmcradio_128.mp3" },
+    { "name": "BFM Business (éco)",    "url": "https://audio.bfmtv.com/bfmbusiness_128.mp3" },
+    { "name": "Sud Radio (talk)",      "url": "https://start-sud.ice.infomaniak.ch/start-sud-high.mp3" },
+    { "name": "RFI Monde",             "url": "https://rfimonde64k.ice.infomaniak.ch/rfimonde-64.mp3" },
+    { "name": "France Bleu Paris",     "url": "https://direct.francebleu.fr/live/fb1071-midfi.mp3" }
   ],
 
   "Belgique (RTBF)": [
-    { "name": "La Première", "url": "https://radio.rtbf.be/lapremiere/mp3-160/me" },
-    { "name": "Musiq3", "url": "https://radio.rtbf.be/musiq3/mp3-320/me" },
-    { "name": "Tipik", "url": "https://radio.rtbf.be/tipik/mp3-160/me" },
-    { "name": "Vivacité Bruxelles", "url": "https://radio.rtbf.be/viva-bxl/mp3-160/me" },
-    { "name": "Tarmac", "url": "https://radio.rtbf.be/tarmac/mp3-160/me" },
-    { "name": "Viva+", "url": "https://radio.rtbf.be/vivaplus/mp3-160/me" },
-    { "name": "Jam.", "url": "https://radio.rtbf.be/jam/mp3-160/me" },
-    { "name": "Viva Sport", "url": "https://radio.rtbf.be/viva-sport/mp3-160/me" },
-
-    { "name": "Classic 21 – 60s", "url": "https://radio.rtbf.be/c21-60s/mp3-128/me" },
-    { "name": "Classic 21 – 70s", "url": "https://radio.rtbf.be/c21-70s/mp3-128/me" },
-    { "name": "Classic 21 – 80s", "url": "https://radio.rtbf.be/c21-80s/mp3-128/me" },
-    { "name": "Classic 21 – 80s New Wave", "url": "https://radio.rtbf.be/c21-80nw/mp3-128/me" },
-    { "name": "Classic 21 – 90s", "url": "https://radio.rtbf.be/c21-90s/mp3-128/me" },
-    { "name": "Classic 21 – Blues", "url": "https://radio.rtbf.be/c21-blues/mp3-128/me" },
-    { "name": "Classic 21 – Metal", "url": "https://radio.rtbf.be/c21-metal/mp3-128/me" },
-    { "name": "Classic 21 – Route 66", "url": "https://radio.rtbf.be/c21-route66/mp3-128/me" },
-    { "name": "Classic 21 – Soulpower", "url": "https://radio.rtbf.be/c21-soul/mp3-128/me" },
-    { "name": "Classic 21 – Noir Jaune Rock", "url": "https://radio.rtbf.be/c21-njr/mp3-128/me" },
-    { "name": "Classic 21 – Live", "url": "https://radio.rtbf.be/c21-live/mp3-128/me" },
-    { "name": "Classic 21 – Underground", "url": "https://radio.rtbf.be/c21-under/mp3-128/me" }
+    { "name": "Classic 21",   "url": "https://icecast.rtbf.be/classic21-128.mp3" },
+    { "name": "La Première",  "url": "https://icecast.rtbf.be/lapremiere-128.mp3" },
+    { "name": "Tipik",        "url": "https://icecast.rtbf.be/tipik-128.mp3" },
+    { "name": "VivaCité",     "url": "https://icecast.rtbf.be/vivacite-128.mp3" },
+    { "name": "Musiq3",       "url": "https://icecast.rtbf.be/musiq3-128.mp3" }
   ],
 
-  "Suisse (SRG SSR)": [
-    { "name": "Radio Swiss Pop (AAC 96)", "url": "https://stream.srg-ssr.ch/srgssr/rsp/aac/96" },
-    { "name": "Radio Swiss Jazz (AAC 96)", "url": "https://stream.srg-ssr.ch/srgssr/rsj/aac/96" },
-    { "name": "Radio Swiss Classic (AAC 96)", "url": "https://stream.srg-ssr.ch/srgssr/rsc_de/aac/96" }
-  ],
+  "International (News/Talk)": [
+    { "name": "BBC World Service (EN)", "url": "https://stream.live.vc.bbcmedia.co.uk/bbc_world_service" },
 
-  "Indé / Monde": [
-    { "name": "SomaFM – Lush", "url": "https://ice5.somafm.com/lush-128-mp3" },
-    { "name": "SomaFM – Drone Zone", "url": "https://ice2.somafm.com/dronezone-128-mp3" },
-    { "name": "SomaFM – Deep Space One", "url": "https://ice5.somafm.com/deepspaceone-128-mp3" },
-    { "name": "SomaFM – Digitalis", "url": "https://ice5.somafm.com/digitalis-128-mp3" },
-    { "name": "SomaFM – Fluid", "url": "https://ice5.somafm.com/fluid-128-mp3" },
+  "Indés / Monde": [
+    { "name": "Radio Paradise Main (AAC 320)",   "url": "https://stream.radioparadise.com/aac-320" },
+    { "name": "Radio Paradise Mellow (AAC 320)", "url": "https://stream.radioparadise.com/mellow-320" },
+    { "name": "Radio Paradise Rock (AAC 320)",   "url": "https://stream.radioparadise.com/rock-320" },
+    { "name": "Radio Paradise World (AAC 320)",  "url": "https://stream.radioparadise.com/world-320" },
 
-    { "name": "Radio Paradise (AAC 320)", "url": "https://stream.radioparadise.com/aac-320" },
-    { "name": "Radio Paradise (MP3 192)", "url": "https://stream.radioparadise.com/mp3-192" },
-
-    { "name": "Nightride FM (Synthwave)", "url": "https://stream.nightride.fm/nightride.m4a" },
-    { "name": "Nightride – Rekt", "url": "https://stream.nightride.fm/rekt.m4a" }
   ]
 }
