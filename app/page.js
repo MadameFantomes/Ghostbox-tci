@@ -1,18 +1,18 @@
 "use client";
 
 /**
- * Ghostbox TCI — FR (no mic) + Squelch/Hold + Convolver "vintage speaker"
- * - Fusion /public/stations.json + /public/stations-extra.json (dédoublonné)
- * - Balayage direct (HLS/playlist écartés) + cache-bust + anti-boucle (watchdog)
- * - Bruit de balayage modulé + click
- * - Squelch/Hold : détecte la voix sur la radio et RETARDE le saut tant que ça parle
- * - ConvolverNode: petite IR synthétique de haut-parleur (grain vintage)
- * - Enregistrement: MP3 si supporté, sinon WAV (radio+bruit+fx)
+ * Ghostbox TCI — FR
+ * - Balayage direct (HLS écarté) + cache-bust + anti-boucle (watchdog)
+ * - Bruit de balayage modulé + clic
+ * - Garde-voix (détection de parole) + Maintien (retarde le saut quand ça parle)
+ * - Convolver “haut-parleur vintage”
+ * - Enregistrement MP3 si possible, sinon WAV
+ * - Biais parlé : pondération des stations `type:"news|talk"` et champ `weight`
  */
 
 import React, { useEffect, useRef, useState } from "react";
 
-/* ========== Helpers codecs (pour filtrer MP3/AAC lisibles) ========== */
+/* ===== Détection codecs (filtrer MP3/AAC jouables) ===== */
 const audioProbe = typeof Audio !== "undefined" ? new Audio() : null;
 const SUPPORT_MP3 = !!audioProbe?.canPlayType?.("audio/mpeg");
 const SUPPORT_AAC = !!(
@@ -26,7 +26,7 @@ function guessCodec(url = "") {
   return "unknown";
 }
 
-/* ========== Réglages ========== */
+/* ===== Réglages ===== */
 const AUTO_FILTER = true;
 const FALLBACK_STATIONS = [
   "https://icecast.radiofrance.fr/fip-midfi.mp3",
@@ -70,15 +70,15 @@ export default function Page() {
   // Watchdog anti-boucle
   const progressRef = useRef({ lastCT: 0, lastWall: 0, timer: null });
 
-  // Analyser pour Squelch
+  // Analyser (Garde-voix)
   const analyserRef = useRef(null);
   const envValRef = useRef(0);
   const envRAFRef = useRef(null);
   const holdUntilRef = useRef(0);
 
-  // Stations
-  const [stations, setStations] = useState(FALLBACK_STATIONS);
-  const stationsRef = useRef(FALLBACK_STATIONS);
+  // Listes stations
+  const [stations, setStations] = useState(FALLBACK_STATIONS);  // liste “affichable” dédupliquée
+  const scanRef = useRef(FALLBACK_STATIONS);                    // liste pondérée pour le balayage
   const [idx, setIdx] = useState(0);
   const idxRef = useRef(0);
 
@@ -91,15 +91,15 @@ export default function Page() {
   const playingLockRef = useRef(false);
 
   // Contrôles
-  const [vitesse, setVitesse] = useState(0.45); // vitesse de balayage
-  const [volume, setVolume]  = useState(0.9);
-  const [echo, setEcho]      = useState(0.25);
-  const [debit, setDebit]    = useState(0.4);   // "quantité" de bruit pendant le saut
+  const [vitesse, setVitesse] = useState(0.45); // vitesse de balayage (250..2500 ms)
+  const [volume, setVolume]   = useState(0.9);
+  const [echo, setEcho]       = useState(0.25);
+  const [bruit, setBruit]     = useState(0.4); // intensité du bruit pendant le saut
 
-  // Squelch/Hold
-  const [squelch, setSquelch]     = useState(true);
-  const [sensi, setSensi]         = useState(0.6); // 0..1 (plus haut = plus sensible, déclenche plus vite)
-  const [holdParam, setHoldParam] = useState(0.55); // 0..1 durée de maintien
+  // Garde-voix (ex-squelch)
+  const [gardeVoix, setGardeVoix] = useState(true);
+  const [sensi, setSensi]         = useState(0.6);  // sensibilité voix
+  const [maintien, setMaintien]   = useState(0.55); // durée de maintien
 
   // Enregistrement
   const [enr, setEnr] = useState(false);
@@ -111,13 +111,13 @@ export default function Page() {
   const clamp01 = (x) => Math.max(0, Math.min(1, x));
   const msFromSpeed = (v) => Math.round(250 + v * (2500 - 250));
   const BASE_NOISE = 0.006;
-  const burstMs  = () => Math.round(120 + debit * 520);
-  const burstGain = () => Math.min(0.40, 0.08 + debit * 0.32);
+  const burstMs  = () => Math.round(120 + bruit * 520);
+  const burstGain = () => Math.min(0.40, 0.08 + bruit * 0.32);
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   const supportsType = (m) => window.MediaRecorder?.isTypeSupported?.(m) || false;
   const nowMs = () => performance.now();
 
-  /* ===== Charger stations (deux fichiers), filtrer par codec ===== */
+  /* ===== Charger stations (fusion json + filtrage codecs + biais parlé) ===== */
   useEffect(() => {
     (async () => {
       const all = [];
@@ -131,11 +131,11 @@ export default function Page() {
       } catch {}
       let flat = all.length ? all : FALLBACK_STATIONS;
 
-      // dédoublonnage par URL
+      // 1) dédoublonner par URL
       const seen = new Set();
       flat = flat.filter((s) => (s && s.url && !seen.has(s.url) ? (seen.add(s.url), true) : false));
 
-      // Filtrage selon codecs dispo
+      // 2) filtrer par codecs supportés
       let playable = flat.filter((s) => {
         const c = guessCodec(s.url);
         if (c === "mp3") return SUPPORT_MP3;
@@ -148,40 +148,55 @@ export default function Page() {
           .sort((a, b) => (guessCodec(b.url) === "mp3") - (guessCodec(a.url) === "mp3"));
       }
 
-      setStations(playable); stationsRef.current = playable;
+      // 3) pondérer pour favoriser le PARLÉ (type "news"/"talk") + champ "weight"
+      const TALK_TYPES = new Set(["talk", "news"]);
+      const weighted = [];
+      for (const s of playable) {
+        const base = TALK_TYPES.has((s.type || "").toLowerCase()) ? 2 : 1; // bonus si talk/news
+        const w = Math.max(1, Math.min(6, Math.round(s.weight || base)));
+        for (let i = 0; i < w; i++) weighted.push(s);
+      }
+      // 4) mélanger la liste pondérée
+      for (let i = weighted.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [weighted[i], weighted[j]] = [weighted[j], weighted[i]];
+      }
+
+      setStations(playable);              // affichage (dédupliqué)
+      scanRef.current = weighted.length ? weighted : playable; // balayage (pondéré)
       idxRef.current = 0; setIdx(0);
     })();
   }, []);
 
   function normalizeStationsJson(json) {
     const out = [];
-    const push = (name, url, suffix = "") => {
+    const push = (name, url, suffix = "", extra = {}) => {
       if (!url || typeof url !== "string") return;
       if (!/^https:/i.test(url)) return;
       if (!isDirectish(url)) return;
       try {
         url = url.trim();
         const nm = (name && name.trim()) || new URL(url).host + suffix;
-        out.push({ name: nm, url });
+        out.push({ name: nm, url, ...extra });
       } catch {}
     };
     if (Array.isArray(json)) {
       json.forEach((s) => {
         if (!s) return;
-        if (s.url) push(s.name, s.url);
-        if (Array.isArray(s.urls)) s.urls.forEach((u, k) => push(s.name, u, ` #${k + 1}`));
+        if (s.url) push(s.name, s.url, "", { type: s.type, lang: s.lang, weight: s.weight });
+        if (Array.isArray(s.urls)) s.urls.forEach((u, k) => push(s.name, u, ` #${k + 1}`, { type: s.type, lang: s.lang, weight: s.weight }));
       });
     } else if (json && typeof json === "object") {
       Object.entries(json).forEach(([group, arr]) => {
         if (!Array.isArray(arr)) return;
         arr.forEach((s) => {
           if (!s) return;
-          if (s.url) push(s.name || group, s.url);
-          if (Array.isArray(s.urls)) s.urls.forEach((u, k) => push(s.name || group, u, ` #${k + 1}`));
+          if (s.url) push(s.name || group, s.url, "", { type: s.type, lang: s.lang, weight: s.weight });
+          if (Array.isArray(s.urls)) s.urls.forEach((u, k) => push(s.name || group, u, ` #${k + 1}`, { type: s.type, lang: s.lang, weight: s.weight }));
         });
       });
     }
-    // Mélange
+    // mélange initial
     for (let i = out.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [out[i], out[j]] = [out[j], out[i]]; }
     return out;
   }
@@ -225,7 +240,7 @@ export default function Page() {
     radioHPRef.current = hp; radioLPRef.current = lp; radioShelfRef.current = shelf;
     driveRef.current = drive; convolverRef.current = conv; radioGainRef.current = gRadio;
 
-    // Noise path
+    // Bruit
     const noise = createNoiseNode(ctx); noiseNodeRef.current = noise;
     const hpN = ctx.createBiquadFilter(); hpN.type = "highpass"; hpN.frequency.value = 160; hpN.Q.value = 0.7;
     const bp  = ctx.createBiquadFilter(); bp.type = "bandpass"; bp.Q.value = 0.55; bp.frequency.value = 1800;
@@ -233,32 +248,29 @@ export default function Page() {
     noiseHPRef.current = hpN; noiseFilterRef.current = bp; noiseLPRef.current = lpN;
     const gNoise = ctx.createGain(); gNoise.gain.value = 0; noiseGainRef.current = gNoise;
 
-    // Echo
+    // Écho
     const dry = ctx.createGain(); dry.gain.value = 1; dryRef.current = dry;
     const dly = ctx.createDelay(1.2); dly.delayTime.value = 0.34;
     const fb  = ctx.createGain(); fb.gain.value = 0.25;
     dly.connect(fb); fb.connect(dly);
     const wet = ctx.createGain(); wet.gain.value = 0; echoDelayRef.current = dly; echoFbRef.current = fb; echoWetRef.current = wet;
 
-    // Click
+    // Clic
     const clickBus = ctx.createGain(); clickBus.gain.value = 0; clickBus.connect(master); clickBusRef.current = clickBus;
 
     // Somme → master
     const sum = ctx.createGain(); sum.gain.value = 1;
     // bruit
     noise.connect(hpN); hpN.connect(bp); bp.connect(lpN); lpN.connect(gNoise); gNoise.connect(sum);
-    // radio (chaîne complète jusqu'au gRadio)
-    // (la source sera branchée dans attachMedia)
-    // Sorties → master & echo
+    // radio (chaîne complète jusqu'au gRadio ; la source arrive dans attachMedia)
     sum.connect(dry);  dry.connect(master);
     sum.connect(dly);  dly.connect(wet); wet.connect(master);
 
     try { noise.start(0); } catch {}
 
-    // Analyser pour Squelch (tap sur le gRadio)
+    // Analyse pour Garde-voix (tap sur gRadio)
     const ana = ctx.createAnalyser(); ana.fftSize = 1024; ana.smoothingTimeConstant = 0.85;
     analyserRef.current = ana;
-    // on branchera gRadio → ana dans attachMedia()
   }
 
   function createNoiseNode(ctx) {
@@ -268,7 +280,6 @@ export default function Page() {
     for (let i = 0; i < size; i++) data[i] = (Math.random() * 2 - 1) * 0.9;
     const src = ctx.createBufferSource(); src.buffer = buf; src.loop = true; return src;
   }
-
   function createDriveNode(ctx, amount = 0.25) {
     const ws = ctx.createWaveShaper(); ws.curve = makeDistortionCurve(amount); ws.oversample = "4x"; return ws;
   }
@@ -277,22 +288,20 @@ export default function Page() {
     for (let i = 0; i < n; i++) { const x = (i * 2) / n - 1; curve[i] = ((1 + k) * x) / (1 + k * Math.abs(x)); }
     return curve;
   }
-
   function makeSpeakerIR(ctx) {
-    // Petite IR synthétique “boîte radio” (~25 ms), stéréo identique
+    // IR synthétique “boîte radio” (~25 ms)
     const len = Math.floor(ctx.sampleRate * 0.025);
     const buf = ctx.createBuffer(2, len, ctx.sampleRate);
     for (let ch = 0; ch < 2; ch++) {
       const d = buf.getChannelData(ch);
-      let a1 = 0, a2 = 0;
-      const f1 = 900 / ctx.sampleRate * 2 * Math.PI;   // petites résonances
+      const f1 = 900 / ctx.sampleRate * 2 * Math.PI;
       const f2 = 2300 / ctx.sampleRate * 2 * Math.PI;
       for (let i = 0; i < len; i++) {
         const t = i / ctx.sampleRate;
-        const decay = Math.exp(-t * 60); // chute rapide
+        const decay = Math.exp(-t * 60);
         const noise = (Math.random() * 2 - 1) * 0.25;
-        a1 = Math.sin(f1 * i) * 0.35;
-        a2 = Math.sin(f2 * i) * 0.15;
+        const a1 = Math.sin(f1 * i) * 0.35;
+        const a2 = Math.sin(f2 * i) * 0.15;
         d[i] = (noise + a1 + a2) * decay;
       }
     }
@@ -314,7 +323,7 @@ export default function Page() {
     } catch {}
   }
 
-  /* ===== Attacher la radio au graphe (avec Convolver + tap Analyser) ===== */
+  /* ===== Attacher la radio (avec convolver + tap analyse) ===== */
   async function attachMedia() {
     if (!ctxRef.current || !audioElRef.current) return;
     if (mediaSrcRef.current) return;
@@ -323,7 +332,7 @@ export default function Page() {
     const el = audioElRef.current;
 
     const chainConnect = (srcNode) => {
-      // src → HP → LP → shelf → drive → convolver → gRadio → (sum)
+      // src → HP → LP → shelf → drive → convolver → gRadio
       srcNode.connect(radioHPRef.current);
       radioHPRef.current.connect(radioLPRef.current);
       radioLPRef.current.connect(radioShelfRef.current);
@@ -331,11 +340,10 @@ export default function Page() {
       driveRef.current.connect(convolverRef.current);
       convolverRef.current.connect(radioGainRef.current);
 
-      // tap pour analyser (pas besoin de connecter l'analyser vers la suite)
+      // tap analyser
       try { radioGainRef.current.connect(analyserRef.current); } catch {}
     };
 
-    // Tentative standard
     try {
       const src = ctx.createMediaElementSource(el);
       mediaSrcRef.current = src;
@@ -344,7 +352,6 @@ export default function Page() {
       return;
     } catch {}
 
-    // Fallback captureStream
     try {
       const stream = el.captureStream?.();
       if (stream && stream.getAudioTracks().length > 0) {
@@ -356,11 +363,10 @@ export default function Page() {
       }
     } catch {}
 
-    // Compat: pas ancré. Pas d'analyse squelch (faute d'accès au flux).
-    setCompat(true);
+    setCompat(true); // pas d’accès flux → pas d’analyse garde-voix
   }
 
-  /* ===== Squelch: boucle d'analyse RMS ===== */
+  /* ===== Boucle “Garde-voix” (enveloppe RMS) ===== */
   function startEnvLoop() {
     stopEnvLoop();
     const ana = analyserRef.current; if (!ana) return;
@@ -368,18 +374,17 @@ export default function Page() {
     const tick = () => {
       ana.getFloatTimeDomainData(buf);
       // RMS
-      let sum = 0;
-      for (let i = 0; i < buf.length; i++) { const v = buf[i]; sum += v * v; }
+      let sum = 0; for (let i = 0; i < buf.length; i++) { const v = buf[i]; sum += v * v; }
       const rms = Math.sqrt(sum / buf.length);
       // lissage
       envValRef.current = envValRef.current * 0.9 + rms * 0.1;
 
-      // Seuil selon sensibilité (entre ~0.015 et ~0.08)
+      // seuil selon sensi (≈0.015..0.08)
       const thr = 0.015 + (1 - clamp01(sensi)) * 0.065;
-      // Durée de maintien 0.4s .. 3.5s
-      const holdMs = 400 + clamp01(holdParam) * 3100;
+      // durée de maintien 0.4s .. 3.5s
+      const holdMs = 400 + clamp01(maintien) * 3100;
 
-      if (squelch && !compat && envValRef.current > thr) {
+      if (gardeVoix && !compat && envValRef.current > thr) {
         holdUntilRef.current = nowMs() + holdMs;
       }
       envRAFRef.current = requestAnimationFrame(tick);
@@ -401,7 +406,6 @@ export default function Page() {
     setMarche(true);
     startEnvLoop();
   }
-
   async function powerOff() {
     stopSweep();
     stopWatchdog();
@@ -415,7 +419,7 @@ export default function Page() {
     playingLockRef.current = false;
   }
 
-  /* ===== Click & Bruit de scan ===== */
+  /* ===== Clic + Bruit de scan ===== */
   function triggerClick(level = 0.28) {
     const ctx = ctxRef.current; if (!ctx || !clickBusRef.current) return;
     const dur = 0.012;
@@ -428,16 +432,15 @@ export default function Page() {
           g.gain.exponentialRampToValueAtTime(0.0001, now + dur); } catch {}
     src.connect(g); src.start();
   }
-
   function playScanBurst(targetGain, durSec) {
     const ctx = ctxRef.current; if (!ctx) return;
     const now = ctx.currentTime;
     const bp = noiseFilterRef.current, hp = noiseHPRef.current, lp = noiseLPRef.current;
     const g = noiseGainRef.current?.gain;
 
-    const q   = 0.35 + debit * 0.45;
-    const lpF = 4200 + debit * 1600;
-    const hpF = 160  + debit * 180;
+    const q   = 0.35 + bruit * 0.45;
+    const lpF = 4200 + bruit * 1600;
+    const hpF = 160  + bruit * 180;
     try {
       bp.Q.setTargetAtTime(q, now, 0.05);
       lp.frequency.setTargetAtTime(lpF, now, 0.08);
@@ -453,7 +456,7 @@ export default function Page() {
       const x = i / steps;
       const f = (x < 0.6) ? fStart + (fMid - fStart) * (x / 0.6)
                           : fMid   + (fEnd - fMid)   * ((x - 0.6) / 0.4);
-      const jitter = (Math.random()*2 - 1) * (80 + 380*(1 - debit));
+      const jitter = (Math.random()*2 - 1) * (80 + 380*(1 - bruit));
       try { bp.frequency.linearRampToValueAtTime(Math.max(300, f + jitter), t); } catch {}
     }
 
@@ -473,7 +476,7 @@ export default function Page() {
 
   /* ===== Lecture d'une station ===== */
   async function playIndex(startIndex, tries = 0) {
-    const list = stationsRef.current;
+    const list = scanRef.current;
     if (!list.length) return;
     if (tries >= list.length) { setEtat("aucun flux lisible"); return; }
     if (playingLockRef.current) return;
@@ -506,7 +509,6 @@ export default function Page() {
       el.preload = "none";
       el.pause();
 
-      // aide au navigateur : préciser le type si on devine
       const codec = guessCodec(url);
       el.removeAttribute("type");
       if (codec === "mp3") el.type = "audio/mpeg";
@@ -525,7 +527,6 @@ export default function Page() {
 
       await attachMedia();
       applyAutoFilterProfile();
-
       startWatchdog();
 
       const after = ctx.currentTime + Math.max(0.08, dur * 0.6);
@@ -581,7 +582,7 @@ export default function Page() {
     const el = audioElRef.current; if (!el) return;
     try {
       setEtat("resync direct…");
-      const cur = stationsRef.current[idxRef.current];
+      const cur = scanRef.current[idxRef.current];
       const url = typeof cur === "string" ? cur : cur.url;
       el.pause(); el.src = ""; el.load();
       await sleep(80);
@@ -592,17 +593,17 @@ export default function Page() {
     } catch {}
   }
 
-  /* ===== Sweep (intègre Squelch/Hold) ===== */
+  /* ===== Balayage (intègre Garde-voix) ===== */
   function startSweep() {
     stopSweep();
     const tick = async () => {
       if (!marche) return;
-      // Squelch: si on a récemment détecté de la voix et qu'on est encore "en maintien", on attend un peu
-      if (squelch && !compat && nowMs() < holdUntilRef.current) {
-        sweepTimerRef.current = setTimeout(tick, 180); // réessaie bientôt
+      // Si parole détectée récemment et qu'on est encore dans la fenêtre de maintien → patienter
+      if (gardeVoix && !compat && nowMs() < holdUntilRef.current) {
+        sweepTimerRef.current = setTimeout(tick, 180);
         return;
       }
-      const list = stationsRef.current; if (!list.length) return;
+      const list = scanRef.current; if (!list.length) return;
       const next = (idxRef.current + 1) % list.length;
       await playIndex(next);
       sweepTimerRef.current = setTimeout(tick, msFromSpeed(vitesse));
@@ -699,12 +700,12 @@ export default function Page() {
     if (!auto) { stopSweep(); return; }
     if (marche) startSweep();
     return stopSweep;
-  }, [auto, vitesse, marche, squelch, sensi, holdParam, compat]);
+  }, [auto, vitesse, marche, gardeVoix, sensi, maintien, compat, bruit]);
 
   function toggleEnr() { if (!enr) startRecording(); else stopRecording(); }
 
-  /* ===== UI render ===== */
-  const list = stationsRef.current;
+  /* ===== UI ===== */
+  const list = scanRef.current;
   const current = list[idxRef.current];
   const currentName = current?.name || (current?.url ? new URL(current.url).host : "");
 
@@ -724,7 +725,7 @@ export default function Page() {
                 <Lamp label="MARCHE" on={marche} />
                 <Lamp label="AUTO"   on={auto} colorOn="#86fb6a" />
                 <Lamp label="ENR"    on={enr}  colorOn="#ff5656" />
-                <Lamp label="SQL"    on={squelch} colorOn="#6ac8ff" />
+                <Lamp label="VOIX"   on={gardeVoix} colorOn="#6ac8ff" />
               </div>
             </div>
           </div>
@@ -734,14 +735,14 @@ export default function Page() {
               <div><strong>{currentName || "—"}</strong></div>
               <div><em style={{ opacity: 0.9 }}>{etat}</em></div>
             </div>
-            {compat && <div style={styles.compatBanner}>Compat : squelch inactif (flux non câblé, CORS).</div>}
+            {compat && <div style={styles.compatBanner}>Mode compatibilité : détection de parole désactivée (CORS).</div>}
           </div>
 
           <div style={styles.controlsRow}>
             <div style={styles.switches}>
               <Switch label="MARCHE" on={marche} onChange={async v => { setMarche(v); v ? await powerOn() : await powerOff(); }} />
               <Switch label="BALAYAGE AUTO" on={auto} onChange={(v) => setAuto(v)} />
-              <Switch label="SQUELCH (Maintien parole)" on={squelch} onChange={(v) => setSquelch(v)} />
+              <Switch label="GARDE-VOIX (détection de parole)" on={gardeVoix} onChange={(v) => setGardeVoix(v)} />
               <Bouton label={enr ? (supportsType("audio/mpeg") ? "STOP ENREG. (MP3)" : "STOP ENREG. (WAV)") : "ENREGISTRER"} onClick={toggleEnr} color={enr ? "#f0c14b" : "#d96254"} />
             </div>
 
@@ -749,9 +750,9 @@ export default function Page() {
               <Knob label="VITESSE" value={vitesse} onChange={(v) => setVitesse(clamp01(v))} hint={`${msFromSpeed(vitesse)} ms`} />
               <Knob label="VOLUME"  value={volume}  onChange={(v) => setVolume(clamp01(v))} />
               <Knob label="ÉCHO"    value={echo}    onChange={(v) => setEcho(clamp01(v))} />
-              <Knob label="DÉBIT"   value={debit}   onChange={(v) => setDebit(clamp01(v))} hint={`${burstMs()} ms bruit`} />
-              <Knob label="SENSI VOIX" value={sensi} onChange={(v) => setSensi(clamp01(v))} />
-              <Knob label="HOLD"    value={holdParam} onChange={(v) => setHoldParam(clamp01(v))} />
+              <Knob label="BRUIT"   value={bruit}   onChange={(v) => setBruit(clamp01(v))} hint={`${burstMs()} ms de bruit`} />
+              <Knob label="SENSIBILITÉ VOIX" value={sensi} onChange={(v) => setSensi(clamp01(v))} />
+              <Knob label="MAINTIEN" value={maintien} onChange={(v) => setMaintien(clamp01(v))} />
             </div>
           </div>
 
@@ -762,7 +763,7 @@ export default function Page() {
       </div>
 
       <p style={{ color: "rgba(255,255,255,0.8)", marginTop: 10, fontSize: 12 }}>
-        Squelch: la Ghostbox suspend le balayage pendant la parole (selon SENSI & HOLD). Convolver: grain “radio vintage”.
+        Le **Garde-voix** suspend le balayage pendant la parole (réglable via Sensibilité & Maintien). La pondération favorise les stations parlées.
       </p>
     </main>
   );
