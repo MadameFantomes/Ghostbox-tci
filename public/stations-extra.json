@@ -4,7 +4,10 @@
     { "name": "France Culture",    "url": "https://icecast.radiofrance.fr/franceculture-midfi.mp3" },
     { "name": "France Musique",    "url": "https://icecast.radiofrance.fr/francemusique-midfi.mp3" },
     { "name": "France Info",       "url": "https://icecast.radiofrance.fr/franceinfo-midfi.mp3" },
-    { "name": "Mouv'",             "url": "https://icecast.radiofrance.fr/mouv-midfi.mp3" },
+  { "name": "Mouv' (MP3)", "url": "https://icecast.radiofrance.fr/mouv-midfi.mp3" },
+  { "name": "Mouv' Rap Français (MP3)", "url": "https://icecast.radiofrance.fr/mouvrapfr-midfi.mp3" }
+
+
 
     { "name": "TSF Jazz",          "url": "https://tsfjazz.ice.infomaniak.ch/tsfjazz-high.mp3" },
     { "name": "Radio Meuh",        "url": "https://radiomeuh.ice.infomaniak.ch/radiomeuh-128.mp3" },
