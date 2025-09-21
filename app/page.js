@@ -2,16 +2,12 @@
 
 /**
  * Ghostbox TCI — FR
- * >>> Scan & radio INCHANGÉS (ton son d'origine) <<<
- * - Bruit de fond discret (BASE_NOISE=0.006)
- * - Burst de balayage adouci + plafonné (playScanBurst intact)
- * - Ducking auto du bruit quand la radio joue
- * - Filtre radio “TCI” auto si WebAudio autorisé (compat sinon)
- * - Charge /public/stations.json sinon fallback
- * - LOG minimal : localStorage("ghostbox.logs") + BroadcastChannel("labo-ghostbox")
- * - UI vintage + curseurs (sliders)
+ * - Scan & radio INCHANGÉS (bruit/burst originaux)
+ * - UI vintage + curseurs
  * - MODE KÖNIG audible (parallèle, intensité réglable)
- * - ENREGISTREMENT **MP3** prioritaire (MediaRecorder audio/mpeg → sinon lamejs CDN → sinon webm)
+ * - Enregistrement MP3 prioritaire (MediaRecorder → lamejs CDN → webm)
+ * - Correctif anti-buffer loop (“mouai”) sur changement de station
+ * - LOG minimal + BroadcastChannel
  */
 
 import React, { useEffect, useRef, useState } from "react";
@@ -447,6 +443,19 @@ export default function Page() {
     src.connect(g); src.start();
   }
 
+  // *** Helper anti-buffer loop ***
+  function withNoCache(u) {
+    try {
+      const url = new URL(u);
+      url.searchParams.set("nocache", Date.now().toString(36));
+      if (!url.searchParams.has("icy-metadata")) url.searchParams.set("icy-metadata", "0");
+      return url.toString();
+    } catch {
+      const sep = u.includes("?") ? "&" : "?";
+      return `${u}${sep}nocache=${Date.now().toString(36)}&icy-metadata=0`;
+    }
+  }
+
   // *** Scan d’ORIGINE (inchangé) ***
   function playScanBurst(targetGain, durSec) {
     const ctx = ctxRef.current; if (!ctx) return;
@@ -492,7 +501,7 @@ export default function Page() {
     } catch {}
   }
 
-  // ------- Lecture robuste (inchangée) -------
+  // ------- Lecture robuste (avec correctif anti-buffer) -------
   async function playIndex(startIndex, tries = 0) {
     const list = stationsRef.current; if (!list.length) return;
     if (tries >= list.length) { setEtat("aucun flux lisible"); return; }
@@ -523,16 +532,39 @@ export default function Page() {
     addLog("scan_burst", { targetNoise, dur });
     await sleep(Math.max(100, dur * 600));
 
-    // 2) charger / jouer
+    // 2) charger / jouer (anti-mémoire tampon)
     try {
       el.crossOrigin = "anonymous";
       el.pause();
-      el.src = url;
+
+      // reset DUR du tag <audio> pour vider tout buffer
+      try { el.srcObject = null; } catch {}
+      try { el.removeAttribute("src"); } catch {}
+      el.load();
+
+      // cache-buster pour forcer un nouveau segment côté serveur
+      const fresh = withNoCache(url);
+      el.src = fresh;
       el.load();
 
       const playP = el.play();
       const timeout = new Promise((_, rej) => setTimeout(() => rej(new Error("timeout")), 3500));
       await Promise.race([playP, timeout]);
+
+      // si le flux ne “avance” pas (boucle de buffer probable) → recharge une fois avec autre cache-buster
+      const t0 = el.currentTime;
+      setTimeout(() => {
+        try {
+          const progressed = Math.abs(el.currentTime - t0) > 0.05;
+          if (!progressed && el.readyState >= 2) {
+            el.pause();
+            const again = withNoCache(url) + "&r=" + Math.random().toString(36).slice(2);
+            el.src = again;
+            el.load();
+            el.play().catch(() => {});
+          }
+        } catch {}
+      }, 1200);
 
       await attachMedia();
       applyAutoFilterProfile();
@@ -547,11 +579,9 @@ export default function Page() {
 
       idxRef.current = startIndex; setIdx(startIndex);
       setEtat(compat ? "lecture (compatibilité)" : "lecture");
-      addLog("play_station", { url, compat });
+      addLog("play_station", { url: fresh, compat });
     } catch {
-      try {
-        noiseGainRef.current.gain.setTargetAtTime(BASE_NOISE, ctx.currentTime + 0.05, 0.12);
-      } catch {}
+      try { noiseGainRef.current.gain.setTargetAtTime(BASE_NOISE, ctx.currentTime + 0.05, 0.12); } catch {}
       const next = (startIndex + 1) % list.length;
       playingLockRef.current = false; await playIndex(next, tries + 1); return;
     }
@@ -757,7 +787,7 @@ export default function Page() {
       </div>
 
       <p style={{ color: "rgba(60,40,20,0.85)", marginTop: 10, fontSize: 12 }}>
-        Scan d’origine conservé • Mode KÖNIG (parallèle) • Enregistrement MP3 (fallback CDN) • UI vintage à curseurs.
+        Scan d’origine conservé • Mode KÖNIG (parallèle) • Enregistrement MP3 • Anti-boucle de buffer actif.
       </p>
     </main>
   );
